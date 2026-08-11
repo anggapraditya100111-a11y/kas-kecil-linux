@@ -12,6 +12,8 @@ const PERMISSION_CATALOG = Object.freeze([
   { code: 'approvals.decide', group: 'Approval', label: 'Menyetujui atau menolak transaksi' },
   { code: 'reports.export_self', group: 'Laporan', label: 'Export transaksi sendiri' },
   { code: 'reports.export_all', group: 'Laporan', label: 'Export seluruh transaksi' },
+  { code: 'account_summary.view', group: 'Laporan', label: 'Melihat rekap dana seluruh akun' },
+  { code: 'account_summary.export', group: 'Laporan', label: 'Export rekap dana seluruh akun' },
   { code: 'accounts.view', group: 'Akun Kas', label: 'Melihat daftar akun dan limit' },
   { code: 'transfers.create', group: 'Transfer Kas', label: 'Mengajukan transfer kas antar-staff' },
   { code: 'transfers.view_self', group: 'Transfer Kas', label: 'Melihat transfer terkait diri sendiri' },
@@ -25,7 +27,8 @@ const PERMISSION_CATALOG = Object.freeze([
   { code: 'users.manage', group: 'Administrasi', label: 'Mengelola pengguna' },
   { code: 'permissions.manage', group: 'Administrasi', label: 'Mengatur hak akses pengguna' },
   { code: 'audit.view', group: 'Administrasi', label: 'Melihat audit log' },
-  { code: 'settings.manage', group: 'Administrasi', label: 'Mengelola pengaturan aplikasi' }
+  { code: 'settings.manage', group: 'Administrasi', label: 'Mengelola pengaturan aplikasi' },
+  { code: 'database.manage', group: 'Administrasi', label: 'Reset dan backup database (khusus Super User)' }
 ]);
 
 const ROLE_DEFAULTS = Object.freeze({
@@ -52,6 +55,8 @@ const ROLE_DEFAULTS = Object.freeze({
     'approvals.view',
     'approvals.decide',
     'reports.export_all',
+    'account_summary.view',
+    'account_summary.export',
     'accounts.view',
     'transfers.view_all',
     'umo.view_all',
@@ -73,6 +78,7 @@ function effectivePermissions(role, overrides = []) {
   if (String(role).toUpperCase() === 'SUPER_USER') {
     return new Set(PERMISSION_CATALOG.map(item => item.code));
   }
+  permissions.delete('database.manage');
   return permissions;
 }
 

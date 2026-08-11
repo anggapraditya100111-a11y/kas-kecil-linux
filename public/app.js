@@ -20,10 +20,12 @@ const pages = [
   { id: 'umo', label: 'Uang Muka Operasional', group: 'Utama', any: ['umo.create', 'umo.view_self', 'umo.view_all'] },
   { id: 'corrections', label: 'Koreksi Transaksi', group: 'Utama', any: ['corrections.create', 'corrections.view_all'] },
   { id: 'approval', label: 'Approval', group: 'Utama', any: ['approvals.view'], badge: true },
+  { id: 'account-summary', label: 'Rekap Dana per Akun', group: 'Laporan', any: ['account_summary.view'] },
   { id: 'users', label: 'Pengguna', group: 'Super User', any: ['users.manage'] },
   { id: 'access', label: 'Hak Akses', group: 'Super User', any: ['permissions.manage'] },
   { id: 'accounts', label: 'Akun Kas', group: 'Super User', any: ['accounts.manage'] },
   { id: 'settings', label: 'Pengaturan', group: 'Super User', any: ['settings.manage'] },
+  { id: 'database', label: 'Pemeliharaan Data', group: 'Super User', any: ['database.manage'] },
   { id: 'audit', label: 'Audit Log', group: 'Super User', any: ['audit.view'] },
   { id: 'profile', label: 'Ubah Password', group: 'Akun', always: true }
 ];
@@ -190,8 +192,9 @@ async function openPage(pageId) {
   state.currentPage = pageId;
   document.querySelectorAll('.nav-btn').forEach(button => button.classList.toggle('active', button.dataset.page === pageId));
   const renderers = { dashboard: renderDashboard, transaction: renderTransaction, ledger: renderLedger, mutations: renderMutations,
-    'account-list': renderAccountList, transfers: renderTransfers, umo: renderUmo, corrections: renderCorrections,
-    approval: renderApproval, users: renderUsers, access: renderAccess, accounts: renderAccounts, settings: renderSettings, audit: renderAudit, profile: renderProfile };
+    'account-list': renderAccountList, 'account-summary': renderAccountSummary, transfers: renderTransfers, umo: renderUmo, corrections: renderCorrections,
+    approval: renderApproval, users: renderUsers, access: renderAccess, accounts: renderAccounts, settings: renderSettings,
+    database: renderDatabaseMaintenance, audit: renderAudit, profile: renderProfile };
   setLoading(true);
   try { await renderers[pageId](); }
   catch (error) { toast(error.message, true); }
@@ -358,6 +361,66 @@ async function exportMutations(format) {
     const match = result.disposition.match(/filename="?([^";]+)"?/i);
     downloadBlob(result.blob, match ? match[1] : `Mutasi_Kas.${format}`);
   } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+async function renderAccountSummary() {
+  const initial = await api('/api/account-summary');
+  document.getElementById('page').innerHTML = `
+    <div class="page-head"><div><h2>Rekap Dana per Akun</h2><p>Total dana seluruh pengguna yang dikelompokkan berdasarkan akun transaksi.</p></div>
+      <div class="actions">${has('account_summary.export') ? '<button class="btn btn-ghost" data-account-summary-export="xlsx">Export Excel</button><button class="btn btn-ghost" data-account-summary-export="pdf">Export PDF</button>' : ''}</div></div>
+    <div class="notice">Hanya transaksi berstatus <strong>APPROVED</strong> yang dihitung. Transaksi asal yang sudah dikoreksi tidak dihitung; realisasi UMO masuk ke akun biaya sesuai pertanggungjawabannya.</div>
+    <div class="card"><form id="account-summary-filter" class="grid-4">
+      <div class="field"><label>Dari tanggal</label><input id="account-summary-start" type="date"></div>
+      <div class="field"><label>Sampai tanggal</label><input id="account-summary-end" type="date"></div>
+      <div class="field"><label>Akun</label><select id="account-summary-account"><option value="">Semua akun</option>${initial.rows.map(row => `<option value="${escapeHtml(row.accountId)}">${escapeHtml(row.accountCode)} — ${escapeHtml(row.accountName)}${row.active ? '' : ' (nonaktif)'}</option>`).join('')}</select></div>
+      <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Terapkan</button></div>
+    </form></div>
+    <div id="account-summary-result"></div>`;
+  document.getElementById('account-summary-filter').addEventListener('submit', event => { event.preventDefault(); loadAccountSummary(); });
+  document.querySelectorAll('[data-account-summary-export]').forEach(button => button.addEventListener('click', () => exportAccountSummary(button.dataset.accountSummaryExport)));
+  drawAccountSummary(initial);
+}
+
+function accountSummaryQuery() {
+  const params = new URLSearchParams({
+    startDate: value('account-summary-start'),
+    endDate: value('account-summary-end'),
+    accountId: value('account-summary-account')
+  });
+  [...params.keys()].forEach(key => { if (!params.get(key)) params.delete(key); });
+  return params;
+}
+
+async function loadAccountSummary() {
+  setLoading(true);
+  try { drawAccountSummary(await api(`/api/account-summary?${accountSummaryQuery()}`)); }
+  catch (error) { toast(error.message, true); }
+  finally { setLoading(false); }
+}
+
+function drawAccountSummary(data) {
+  const rows = data.rows || [];
+  const totals = data.totals || {};
+  document.getElementById('account-summary-result').innerHTML = `
+    <div class="grid-4 summary-metrics">
+      <div class="card metric in"><span>Total dana masuk</span><strong>${money(totals.totalIn)}</strong></div>
+      <div class="card metric out"><span>Total dana keluar</span><strong>${money(totals.totalOut)}</strong></div>
+      <div class="card metric"><span>Penyesuaian</span><strong>${money(totals.totalAdjustment)}</strong></div>
+      <div class="card metric ${Number(totals.netAmount) < 0 ? 'out' : 'in'}"><span>Neto periode</span><strong>${money(totals.netAmount)}</strong></div>
+    </div>
+    <div class="card"><div class="page-head"><div><h3>${rows.length} akun ditampilkan</h3><p>${Number(totals.transactionCount || 0)} transaksi approved</p></div></div>
+      ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama akun</th><th>Cakupan</th><th>Status</th><th>Jumlah transaksi</th><th>Dana masuk</th><th>Dana keluar</th><th>Penyesuaian</th><th>Neto</th></tr></thead><tbody>${rows.map(row => `<tr><td><strong>${escapeHtml(row.accountCode)}</strong></td><td>${escapeHtml(row.accountName)}</td><td>${escapeHtml(typeLabel(row.transactionScope))}</td><td>${statusHtml(row.active ? 'ACTIVE' : 'INACTIVE')}</td><td class="amount">${row.transactionCount}</td><td class="amount amount-in">${money(row.totalIn)}</td><td class="amount amount-out">${money(row.totalOut)}</td><td class="amount">${money(row.totalAdjustment)}</td><td class="amount ${row.netAmount < 0 ? 'amount-out' : 'amount-in'}"><strong>${money(row.netAmount)}</strong></td></tr>`).join('')}</tbody></table></div>` : empty('Belum ada akun.')}
+    </div>`;
+}
+
+async function exportAccountSummary(format) {
+  setLoading(true);
+  try {
+    const result = await apiBlob(`/api/reports/account-summary.${format}?${accountSummaryQuery()}`);
+    const match = result.disposition.match(/filename="?([^";]+)"?/i);
+    downloadBlob(result.blob, match ? match[1] : `Rekap_Dana_Akun.${format}`);
+  } catch (error) { toast(error.message, true); }
+  finally { setLoading(false); }
 }
 
 async function renderAccountList() {
@@ -651,6 +714,67 @@ async function uploadLogo(event) {
   finally { setLoading(false); }
 }
 
+async function renderDatabaseMaintenance() {
+  const data = await api('/api/admin/database/backups');
+  document.getElementById('page').innerHTML = `
+    <div class="page-head"><div><h2>Pemeliharaan Data</h2><p>Backup, riwayat arsip, dan reset data transaksi khusus Super User.</p></div><button id="create-backup" class="btn btn-ghost">Buat backup sekarang</button></div>
+    <div class="card danger-zone"><h3>Reset Data Transaksi</h3>
+      <div class="notice warn"><strong>Perhatian:</strong> transaksi, mutasi, transfer, UMO, koreksi, approval, nomor urut, dan audit log akan dikosongkan. Pengguna, akun, hak akses, logo, pengaturan, serta file bukti tetap dipertahankan. Database lama otomatis diarsipkan sebelum reset.</div>
+      <form id="database-clear-form">
+        <div class="grid-2"><div class="field"><label>Password Super User saat ini</label><input id="database-password" type="password" autocomplete="current-password" required></div>
+        <div class="field"><label>Ketik HAPUS DATA TRANSAKSI</label><input id="database-confirmation" autocomplete="off" required></div></div>
+        <button class="btn btn-danger" type="submit">Backup dan Reset Data Transaksi</button>
+      </form><div id="database-clear-result"></div>
+    </div>
+    <div class="card"><div class="page-head"><div><h3>Riwayat Backup Database</h3><p>Backup sebelum reset dipertahankan sebagai historical database.</p></div></div>${backupTable(data.backups || [])}</div>`;
+  document.getElementById('create-backup').addEventListener('click', createManualBackup);
+  document.getElementById('database-clear-form').addEventListener('submit', clearDatabase);
+  bindBackupDownloads();
+}
+
+function backupTable(backups) {
+  if (!backups.length) return empty('Belum ada backup database.');
+  return `<div class="table-wrap"><table><thead><tr><th>Waktu</th><th>Jenis</th><th>Nama file</th><th>Ukuran</th><th>Aksi</th></tr></thead><tbody>${backups.map(backup => `<tr><td>${escapeHtml(formatDateTime(backup.createdAt))}</td><td>${escapeHtml(backup.typeLabel)}</td><td><span class="backup-name">${escapeHtml(backup.fileName)}</span></td><td>${escapeHtml(formatBytes(backup.size))}</td><td><button class="btn btn-sm" data-backup-download="${escapeHtml(backup.downloadUrl)}" data-backup-name="${escapeHtml(backup.fileName)}">Download</button></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function bindBackupDownloads() {
+  document.querySelectorAll('[data-backup-download]').forEach(button => button.addEventListener('click', async () => {
+    setLoading(true);
+    try {
+      const result = await apiBlob(button.dataset.backupDownload);
+      downloadBlob(result.blob, button.dataset.backupName || 'backup.sqlite');
+    } catch (error) { toast(error.message, true); }
+    finally { setLoading(false); }
+  }));
+}
+
+async function createManualBackup() {
+  setLoading(true);
+  try {
+    const result = await api('/api/admin/database/backups', { method: 'POST' });
+    toast(`Backup ${result.backup.fileName} berhasil dibuat.`);
+    await renderDatabaseMaintenance();
+  } catch (error) { toast(error.message, true); }
+  finally { setLoading(false); }
+}
+
+async function clearDatabase(event) {
+  event.preventDefault();
+  const confirmation = value('database-confirmation');
+  if (confirmation.toUpperCase() !== 'HAPUS DATA TRANSAKSI') return toast('Teks konfirmasi belum sesuai.', true);
+  if (!window.confirm('Data transaksi aktif akan dikosongkan setelah backup dibuat. Lanjutkan reset?')) return;
+  setLoading(true);
+  try {
+    const result = await api('/api/admin/database/clear', { method: 'POST', body: { currentPassword: value('database-password'), confirmation } });
+    await bootstrap();
+    await renderDatabaseMaintenance();
+    const target = document.getElementById('database-clear-result');
+    if (target) target.innerHTML = `<div class="notice success">Reset berhasil. ${Number(result.recordCount || 0).toLocaleString('id-ID')} record operasional dibersihkan. Backup historical: <strong>${escapeHtml(result.backup.fileName)}</strong>.</div>`;
+    toast('Data transaksi berhasil direset dan backup historical tersimpan.');
+  } catch (error) { toast(error.message, true); }
+  finally { setLoading(false); }
+}
+
 async function renderAudit() {
   const data = await api('/api/audit?limit=300');
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Audit Log</h2><p>Riwayat aktivitas penting aplikasi.</p></div></div><div class="card">${auditTable(data.rows)}</div>`;
@@ -818,6 +942,7 @@ function roleLabel(role) { return ({ STAFF: 'Staff', SPV: 'Supervisor', SUPER_US
 function typeLabel(type) { return ({ MASUK: 'Kas Masuk', KELUAR: 'Kas Keluar', BOTH: 'Kas Masuk & Keluar', PENYESUAIAN: 'Penyesuaian' })[type] || type; }
 function sourceLabel(type) { return ({ TRANSACTION: 'Transaksi', TRANSFER: 'Transfer Kas', UMO_ISSUE: 'Pencairan UMO', UMO_RETURN: 'Pengembalian UMO', UMO_EXTRA: 'Tambahan UMO', CORRECTION_REVERSAL: 'Koreksi/Reversal' })[type] || type; }
 function money(number) { return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(Number(number || 0)); }
+function formatBytes(number) { const bytes = Number(number || 0); if (bytes < 1024) return `${bytes} B`; if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`; return `${(bytes / (1024 * 1024)).toFixed(1)} MB`; }
 function todayInput() { const d = new Date(); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); }
 function datePlusDays(days) { const date = new Date(); date.setDate(date.getDate() + Number(days || 0)); return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-'); }
 function formatDateTime(value) { return value ? new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : ''; }

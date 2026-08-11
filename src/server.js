@@ -12,6 +12,7 @@ const cron = require('node-cron');
 
 const {
   db,
+  BACKUP_DIR,
   PERMISSION_CATALOG,
   nowIso,
   getSetting,
@@ -20,7 +21,8 @@ const {
   getUserPermissions,
   audit,
   cleanupExpiredSessions,
-  backupDatabase
+  backupDatabase,
+  listDatabaseBackups
 } = require('./db');
 const { ROLE_DEFAULTS } = require('./permissions');
 const {
@@ -40,7 +42,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
 const DEFAULT_COMPANY_NAME = process.env.DEFAULT_COMPANY_NAME || 'Nama Perusahaan';
@@ -189,6 +191,13 @@ function requirePermission(code) {
     if (!req.auth.permissions.has(code)) return next(new AppError('Anda tidak memiliki hak akses ke menu atau tindakan ini.', 403));
     next();
   };
+}
+
+function requireSuperUser(req, _res, next) {
+  if (req.auth.user.role !== 'SUPER_USER' || !req.auth.permissions.has('database.manage')) {
+    return next(new AppError('Tindakan ini hanya dapat dilakukan oleh Super User.', 403));
+  }
+  next();
 }
 
 function hasPermission(req, code) {
@@ -943,6 +952,65 @@ app.get('/api/mutations', authMiddleware, (req, res, next) => {
   try { res.json(queryMutations(req, req.query)); } catch (error) { next(error); }
 });
 
+// ---------- Rekap dana per akun ----------
+
+function validatedDate(value, label) {
+  if (!value) return '';
+  const text = String(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || new Date(`${text}T00:00:00.000Z`).toISOString().slice(0, 10) !== text) {
+    throw new AppError(`${label} tidak valid.`);
+  }
+  return text;
+}
+
+function queryAccountSummary(query = {}) {
+  const startDate = validatedDate(query.startDate, 'Tanggal awal');
+  const endDate = validatedDate(query.endDate, 'Tanggal akhir');
+  if (startDate && endDate && startDate > endDate) throw new AppError('Tanggal awal tidak boleh melebihi tanggal akhir.');
+  const accountId = String(query.accountId || '').trim();
+  const joinConditions = ["t.account_id=a.id", "t.status='APPROVED'"];
+  const params = [];
+  if (startDate) { joinConditions.push('t.transaction_date>=?'); params.push(startDate); }
+  if (endDate) { joinConditions.push('t.transaction_date<=?'); params.push(endDate); }
+  const where = [];
+  if (accountId) { where.push('a.id=?'); params.push(accountId); }
+  const rows = db.prepare(`
+    SELECT a.id AS account_id,a.code AS account_code,a.name AS account_name,a.transaction_scope,a.active,
+      COUNT(t.id) AS transaction_count,
+      COALESCE(SUM(CASE WHEN t.type='MASUK' THEN t.amount ELSE 0 END),0) AS total_in,
+      COALESCE(SUM(CASE WHEN t.type='KELUAR' THEN t.amount ELSE 0 END),0) AS total_out,
+      COALESCE(SUM(CASE WHEN t.type='PENYESUAIAN' THEN t.amount ELSE 0 END),0) AS total_adjustment
+    FROM accounts a
+    LEFT JOIN transactions t ON ${joinConditions.join(' AND ')}
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+    GROUP BY a.id,a.code,a.name,a.transaction_scope,a.active
+    ORDER BY a.code
+  `).all(...params).map(row => ({
+    accountId: row.account_id,
+    accountCode: row.account_code,
+    accountName: row.account_name,
+    transactionScope: row.transaction_scope,
+    active: Boolean(row.active),
+    transactionCount: Number(row.transaction_count),
+    totalIn: Number(row.total_in),
+    totalOut: Number(row.total_out),
+    totalAdjustment: Number(row.total_adjustment),
+    netAmount: Number(row.total_in) - Number(row.total_out) + Number(row.total_adjustment)
+  }));
+  const totals = rows.reduce((sum, row) => ({
+    transactionCount: sum.transactionCount + row.transactionCount,
+    totalIn: sum.totalIn + row.totalIn,
+    totalOut: sum.totalOut + row.totalOut,
+    totalAdjustment: sum.totalAdjustment + row.totalAdjustment,
+    netAmount: sum.netAmount + row.netAmount
+  }), { transactionCount: 0, totalIn: 0, totalOut: 0, totalAdjustment: 0, netAmount: 0 });
+  return { startDate, endDate, accountId, rows, totals };
+}
+
+app.get('/api/account-summary', authMiddleware, requirePermission('account_summary.view'), (req, res, next) => {
+  try { res.json(queryAccountSummary(req.query)); } catch (error) { next(error); }
+});
+
 // ---------- Transfer kas antar-staff ----------
 
 function transferPublic(row) {
@@ -1537,6 +1605,67 @@ app.patch('/api/admin/settings', authMiddleware, requirePermission('settings.man
   } catch (error) { next(error); }
 });
 
+function backupPublic(record) {
+  const labels = { AUTOMATIC: 'Otomatis', MANUAL: 'Manual', BEFORE_CLEAR: 'Sebelum reset' };
+  return {
+    fileName: record.fileName,
+    type: record.type,
+    typeLabel: labels[record.type] || record.type,
+    size: Number(record.size),
+    createdAt: record.createdAt,
+    downloadUrl: `/api/admin/database/backups/${encodeURIComponent(record.fileName)}`
+  };
+}
+
+app.get('/api/admin/database/backups', authMiddleware, requireSuperUser, (_req, res) => {
+  res.json({ backups: listDatabaseBackups().map(backupPublic) });
+});
+
+app.post('/api/admin/database/backups', authMiddleware, requireSuperUser, asyncRoute(async (req, res) => {
+  const destination = await backupDatabase('manual');
+  const record = listDatabaseBackups().find(item => item.fileName === path.basename(destination));
+  audit(req.auth.user.id, 'CREATE_BACKUP', 'DATABASE', path.basename(destination), '', '', 'Super User membuat backup manual');
+  res.status(201).json({ ok: true, backup: record ? backupPublic(record) : { fileName: path.basename(destination) } });
+}));
+
+app.get('/api/admin/database/backups/:fileName', authMiddleware, requireSuperUser, (req, res, next) => {
+  const fileName = path.basename(String(req.params.fileName || ''));
+  if (!/^kas-kecil-.*\.sqlite$/.test(fileName)) return next(new AppError('File backup tidak valid.', 400));
+  const record = listDatabaseBackups().find(item => item.fileName === fileName);
+  if (!record || path.dirname(path.resolve(record.filePath)) !== path.resolve(BACKUP_DIR)) return next(new AppError('File backup tidak ditemukan.', 404));
+  audit(req.auth.user.id, 'DOWNLOAD_BACKUP', 'DATABASE', fileName, '', '', 'Backup database diunduh');
+  res.download(record.filePath, fileName, error => {
+    if (error && !res.headersSent) next(error);
+  });
+});
+
+app.post('/api/admin/database/clear', authMiddleware, requireSuperUser, asyncRoute(async (req, res) => {
+  if (String(req.body.confirmation || '').trim().toUpperCase() !== 'HAPUS DATA TRANSAKSI') {
+    throw new AppError('Ketik HAPUS DATA TRANSAKSI untuk mengonfirmasi reset.');
+  }
+  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  if (!user || !verifyPassword(String(req.body.currentPassword || ''), user.password_salt, user.password_hash)) {
+    throw new AppError('Password Super User tidak sesuai.', 401);
+  }
+
+  const tableOrder = [
+    'approval_requests', 'approvals', 'transaction_corrections', 'umo_allocations',
+    'ledger_entries', 'cash_transfers', 'operational_advances', 'transactions', 'sequences', 'audit_logs'
+  ];
+  const destination = await backupDatabase('before-clear');
+  const cleared = Object.fromEntries(tableOrder.map(table => [table, Number(db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get().total)]));
+  const clearOperationalData = db.transaction(() => {
+    for (const table of tableOrder) db.prepare(`DELETE FROM ${table}`).run();
+    db.prepare("UPDATE settings SET value='',updated_by=?,updated_at=? WHERE key='LAST_TRANSACTION_DATE'").run(req.auth.user.id, nowIso());
+    db.prepare("UPDATE settings SET value='0',updated_by=?,updated_at=? WHERE key='LAST_TRANSACTION_SEQUENCE'").run(req.auth.user.id, nowIso());
+  });
+  clearOperationalData();
+  const recordCount = Object.values(cleared).reduce((sum, count) => sum + count, 0);
+  audit(req.auth.user.id, 'CLEAR_DATABASE', 'DATABASE', path.basename(destination), cleared, { recordCount: 0 }, 'Data transaksi direset setelah backup otomatis');
+  const record = listDatabaseBackups().find(item => item.fileName === path.basename(destination));
+  res.json({ ok: true, backup: record ? backupPublic(record) : { fileName: path.basename(destination) }, cleared, recordCount });
+}));
+
 app.get('/api/audit', authMiddleware, requirePermission('audit.view'), (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 200), 1), 500);
   const rows = db.prepare(`SELECT l.*, u.name AS user_name FROM audit_logs l LEFT JOIN users u ON u.id=l.user_id ORDER BY l.timestamp DESC LIMIT ?`).all(limit);
@@ -1544,6 +1673,70 @@ app.get('/api/audit', authMiddleware, requirePermission('audit.view'), (req, res
 });
 
 // ---------- Reports ----------
+
+app.get('/api/reports/account-summary.:format', authMiddleware, requirePermission('account_summary.export'), asyncRoute(async (req, res) => {
+  const format = String(req.params.format).toLowerCase();
+  if (!['xlsx', 'pdf'].includes(format)) throw new AppError('Format laporan tidak didukung.', 404);
+  const data = queryAccountSummary(req.query);
+  const stamp = localToday().replace(/-/g, '');
+  const period = data.startDate || data.endDate
+    ? `${data.startDate || 'awal'} s.d. ${data.endDate || 'sekarang'}`
+    : 'Seluruh periode';
+  audit(req.auth.user.id, `EXPORT_ACCOUNT_SUMMARY_${format.toUpperCase()}`, 'ACCOUNT', data.accountId || 'ALL', '', { count: data.rows.length, period }, 'Export rekap dana per akun');
+
+  if (format === 'xlsx') {
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = getSetting('COMPANY_NAME', DEFAULT_COMPANY_NAME);
+    const sheet = workbook.addWorksheet('Rekap Dana per Akun', { views: [{ state: 'frozen', ySplit: 1 }] });
+    sheet.columns = [
+      { header: 'Kode', key: 'accountCode', width: 15 },
+      { header: 'Nama Akun', key: 'accountName', width: 30 },
+      { header: 'Cakupan', key: 'transactionScope', width: 15 },
+      { header: 'Status Akun', key: 'accountStatus', width: 14 },
+      { header: 'Jumlah Transaksi', key: 'transactionCount', width: 18 },
+      { header: 'Dana Masuk', key: 'totalIn', width: 18 },
+      { header: 'Dana Keluar', key: 'totalOut', width: 18 },
+      { header: 'Penyesuaian', key: 'totalAdjustment', width: 18 },
+      { header: 'Neto', key: 'netAmount', width: 18 }
+    ];
+    data.rows.forEach(row => sheet.addRow({ ...row, accountStatus: row.active ? 'Aktif' : 'Nonaktif' }));
+    const totalRow = sheet.addRow({ accountCode: 'TOTAL', accountName: period, ...data.totals });
+    sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2747' } };
+    totalRow.font = { bold: true };
+    totalRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEAF2FF' } };
+    ['totalIn', 'totalOut', 'totalAdjustment', 'netAmount'].forEach(key => { sheet.getColumn(key).numFmt = 'Rp #,##0;[Red]-Rp #,##0'; });
+    res.attachment(`Rekap_Dana_Akun_${stamp}.xlsx`);
+    res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    await workbook.xlsx.write(res); return res.end();
+  }
+
+  res.attachment(`Rekap_Dana_Akun_${stamp}.pdf`); res.type('application/pdf');
+  const doc = new PDFDocument({ size: 'A4', margin: 34, layout: 'landscape' }); doc.pipe(res);
+  doc.fontSize(17).fillColor('#0f2747').text('Rekap Dana per Akun');
+  doc.fontSize(9).fillColor('#64748b').text(`${getSetting('COMPANY_NAME', DEFAULT_COMPANY_NAME)} | Periode: ${period}`); doc.moveDown();
+  const columns = [34, 92, 215, 282, 338, 430, 522, 614];
+  const widths = columns.map((x, index) => (columns[index + 1] || 807) - x - 5);
+  const headers = ['Kode', 'Nama akun', 'Cakupan', 'Jml.', 'Masuk', 'Keluar', 'Penyesuaian', 'Neto'];
+  const rupiah = amount => `Rp ${Number(amount).toLocaleString('id-ID')}`;
+  const drawHeader = () => {
+    const top = doc.y;
+    doc.rect(34, top, 773, 20).fill('#0f2747');
+    headers.forEach((label, index) => doc.fontSize(7.5).fillColor('#ffffff').text(label, columns[index], top + 6, { width: widths[index] }));
+    doc.y = top + 25;
+  };
+  drawHeader();
+  const reportRows = [...data.rows, { accountCode: 'TOTAL', accountName: period, transactionScope: '', ...data.totals, total: true }];
+  for (const row of reportRows) {
+    if (doc.y > 535) { doc.addPage(); drawHeader(); }
+    const y = doc.y;
+    const values = [row.accountCode, row.accountName, row.transactionScope, row.transactionCount, rupiah(row.totalIn), rupiah(row.totalOut), rupiah(row.totalAdjustment), rupiah(row.netAmount)];
+    if (row.total) doc.rect(34, y - 3, 773, 23).fill('#eaf2ff');
+    values.forEach((value, index) => doc.fontSize(7.3).fillColor('#172033').font(row.total ? 'Helvetica-Bold' : 'Helvetica').text(String(value ?? ''), columns[index], y, { width: widths[index], height: 18, ellipsis: true }));
+    doc.y = y + 23;
+  }
+  doc.end();
+}));
 
 app.get('/api/reports/mutations.:format', authMiddleware, asyncRoute(async (req, res) => {
   const format = String(req.params.format).toLowerCase();

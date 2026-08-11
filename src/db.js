@@ -462,18 +462,47 @@ function cleanupExpiredSessions() {
   db.prepare('DELETE FROM sessions WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)').run(nowIso(), cutoff);
 }
 
-async function backupDatabase() {
+function backupType(fileName) {
+  if (fileName.startsWith('kas-kecil-before-clear-')) return 'BEFORE_CLEAR';
+  if (fileName.startsWith('kas-kecil-manual-')) return 'MANUAL';
+  return 'AUTOMATIC';
+}
+
+function listDatabaseBackups() {
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  return fs.readdirSync(BACKUP_DIR)
+    .filter(name => /^kas-kecil-.*\.sqlite$/.test(name))
+    .map(name => {
+      const filePath = path.join(BACKUP_DIR, name);
+      const stat = fs.statSync(filePath);
+      return {
+        fileName: name,
+        filePath,
+        type: backupType(name),
+        size: stat.size,
+        createdAt: stat.mtime.toISOString(),
+        mtime: stat.mtimeMs
+      };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+async function backupDatabase(kind = 'automatic') {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const labels = { automatic: 'auto', manual: 'manual', 'before-clear': 'before-clear' };
+  const label = labels[kind] || labels.automatic;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destination = path.join(BACKUP_DIR, `kas-kecil-${stamp}.sqlite`);
+  const destination = path.join(BACKUP_DIR, `kas-kecil-${label}-${stamp}.sqlite`);
   const escapedDestination = destination.replace(/'/g, "''");
   db.exec(`VACUUM INTO '${escapedDestination}'`);
-  const files = fs.readdirSync(BACKUP_DIR)
-    .filter(name => /^kas-kecil-.*\.sqlite$/.test(name))
-    .map(name => ({ name, path: path.join(BACKUP_DIR, name), mtime: fs.statSync(path.join(BACKUP_DIR, name)).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  for (const file of files.slice(30)) fs.unlinkSync(file.path);
-  audit('SYSTEM', 'BACKUP', 'DATABASE', path.basename(destination), '', '', 'Backup database otomatis');
+  const automaticFiles = listDatabaseBackups().filter(file => file.type === 'AUTOMATIC');
+  for (const file of automaticFiles.slice(30)) fs.unlinkSync(file.filePath);
+  const descriptions = {
+    automatic: 'Backup database otomatis',
+    manual: 'Backup database manual',
+    'before-clear': 'Backup database sebelum reset data transaksi'
+  };
+  audit('SYSTEM', 'BACKUP', 'DATABASE', path.basename(destination), '', { kind }, descriptions[kind] || descriptions.automatic);
   return destination;
 }
 
@@ -492,5 +521,6 @@ module.exports = {
   getUserPermissions,
   audit,
   cleanupExpiredSessions,
-  backupDatabase
+  backupDatabase,
+  listDatabaseBackups
 };

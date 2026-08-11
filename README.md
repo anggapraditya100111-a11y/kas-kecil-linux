@@ -8,11 +8,13 @@ Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux 
 - Approval melalui tautan publik dan PIN approver 8 digit tanpa login.
 - Hak akses granular untuk Staff, SPV, dan Super User.
 - Mutasi kas per pengguna seperti rekening koran.
+- Rekap total dana seluruh akun dengan filter tanggal/akun dan export Excel/PDF.
 - Transfer kas antar-staff dengan approval.
 - Uang Muka Operasional (UMO) dan PDF tanda terima.
 - Koreksi transaksi dengan reversal agar jejak audit tetap utuh.
 - Branding, warna tema, dark mode, dan tampilan desktop/mobile.
-- Export Excel/PDF serta backup database otomatis.
+- Export Excel/PDF, backup otomatis/manual, dan riwayat backup.
+- Reset data transaksi khusus Super User dengan backup historis otomatis sebelum penghapusan.
 
 ## Persyaratan
 
@@ -56,7 +58,9 @@ Secara bawaan data persisten berada di:
 - Bukti transaksi: `/var/lib/kas-kecil/uploads`
 - Backup: `/var/lib/kas-kecil/backups`
 
-Lokasi ini dapat diubah melalui `DATA_ROOT` pada `.env`. Jangan menghapus `.env` atau folder data ketika melakukan pembaruan.
+Lokasi ini dapat diubah melalui `DATA_ROOT` pada `.env`. Jangan menghapus `.env` atau folder data ketika melakukan pembaruan. Backup harian otomatis menyimpan 30 versi terakhir; backup manual dan backup sebelum reset tidak masuk rotasi tersebut.
+
+Menu **Pemeliharaan Data** hanya tersedia bagi Super User. Reset memerlukan password aktif dan konfirmasi khusus, lalu menghapus data operasional setelah backup berhasil. Pengguna, akun, hak akses, pengaturan, logo, dan file bukti tetap dipertahankan.
 
 ## Domain dan HTTPS
 

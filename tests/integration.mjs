@@ -3,12 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'kas-kecil-v13-'));
+const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'kas-kecil-v14-'));
 process.env.PORT = process.env.PORT || '18090';
 process.env.DATA_DIR = path.join(runtime, 'data');
 process.env.UPLOAD_DIR = path.join(runtime, 'uploads');
 process.env.BACKUP_DIR = path.join(runtime, 'backups');
-process.env.APP_PEPPER = 'integration-secret-v13-1234567890';
+process.env.APP_PEPPER = 'integration-secret-v14-1234567890';
 process.env.INITIAL_ADMIN_PASSWORD = 'Admin12345';
 process.env.NODE_ENV = 'test';
 
@@ -75,11 +75,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.3.0');
+  assert.equal(health.version, '1.4.0');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.3.0', '/styles.css?v=1.3.0']) {
+  for (const asset of ['/app.js?v=1.4.0', '/styles.css?v=1.4.0']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -132,6 +132,8 @@ async function main() {
   assert(staffAccess.effectivePermissions.includes('umo.create'));
   assert(!spvAccess.effectivePermissions.includes('transactions.create'));
   assert(spvAccess.effectivePermissions.includes('mutations.view_all'));
+  assert(spvAccess.effectivePermissions.includes('account_summary.view'));
+  assert(!spvAccess.effectivePermissions.includes('database.manage'));
   assert.equal(spvAccess.hasApprovalPin, true);
 
   const staffA = await login('staff.a', 'Staff12345');
@@ -220,19 +222,52 @@ async function main() {
   assert(ledger.rows.some(row => row.status === 'CORRECTED'));
   assert(ledger.rows.some(row => row.sourceType === 'UMO' && row.cashEffect === false));
 
+  const accountSummary = await request(`/api/account-summary?startDate=${new Date().toISOString().slice(0, 10)}&endDate=${new Date().toISOString().slice(0, 10)}`, { cookie: admin });
+  const outgoingSummary = accountSummary.rows.find(row => row.accountId === outgoing.accountId);
+  const incomingSummary = accountSummary.rows.find(row => row.accountId === incoming.accountId);
+  assert.equal(outgoingSummary.transactionCount, 2, 'Transaksi asal yang dikoreksi harus dikeluarkan dari rekap akun');
+  assert.equal(outgoingSummary.totalOut, 1150, 'Realisasi UMO dan transaksi pengganti harus masuk rekap akun');
+  assert.equal(incomingSummary.totalIn, 10000);
+  assert.equal(accountSummary.totals.netAmount, 8850);
+  await request('/api/account-summary?startDate=2026-02-30', { cookie: admin, expected: 400 });
+  await request('/api/account-summary', { cookie: staffA, expected: 403 });
+
   await assertDownload('/api/reports/mutations.xlsx', staffA, /spreadsheetml/);
   await assertDownload('/api/reports/mutations.pdf', staffA, /application\/pdf/);
   await assertDownload('/api/reports/ledger.xlsx', staffA, /spreadsheetml/);
+  await assertDownload('/api/reports/account-summary.xlsx', admin, /spreadsheetml/);
+  await assertDownload('/api/reports/account-summary.pdf', admin, /application\/pdf/);
 
   const spv = await login('spv.kas', 'Supervisor12345');
   await request('/api/transactions', { cookie: spv, method: 'POST', body: {}, expected: 403 });
   const allMutations = await request(`/api/mutations?userId=${staffBResult.userId}`, { cookie: spv });
   assert.equal(allMutations.balance, 2000);
+  assert.equal((await request('/api/account-summary', { cookie: spv })).totals.netAmount, 8850);
+  await request('/api/admin/database/clear', { cookie: spv, method: 'POST', body: { currentPassword: 'Supervisor12345', confirmation: 'HAPUS DATA TRANSAKSI' }, expected: 403 });
+  await request('/api/admin/database/clear', { cookie: admin, method: 'POST', body: { currentPassword: 'salah-password', confirmation: 'HAPUS DATA TRANSAKSI' }, expected: 401 });
+
+  const cleared = await request('/api/admin/database/clear', {
+    cookie: admin, method: 'POST', body: { currentPassword: 'Admin12345', confirmation: 'HAPUS DATA TRANSAKSI' }
+  });
+  assert.match(cleared.backup.fileName, /^kas-kecil-before-clear-.*\.sqlite$/);
+  assert(cleared.recordCount > 0);
+  for (const table of ['transactions', 'ledger_entries', 'cash_transfers', 'operational_advances', 'umo_allocations', 'transaction_corrections', 'approval_requests']) {
+    assert.equal(integrationDb.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get().total, 0, `${table} belum kosong`);
+  }
+  assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM users').get().total, 4, 'Pengguna harus dipertahankan');
+  assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM accounts').get().total, 2, 'Akun harus dipertahankan');
+  assert.equal((await request('/api/account-summary', { cookie: admin })).totals.transactionCount, 0);
+  const backupHistory = await request('/api/admin/database/backups', { cookie: admin });
+  assert(backupHistory.backups.some(backup => backup.fileName === cleared.backup.fileName && backup.type === 'BEFORE_CLEAR'));
+  await assertDownload(`/api/admin/database/backups/${encodeURIComponent(cleared.backup.fileName)}`, admin, /octet-stream|sqlite/, 1000);
+  const auditRows = await request('/api/audit?limit=20', { cookie: admin });
+  assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.3.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.4.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
-    umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true
+    umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
+    accountSummary: true, accountSummaryExport: true, protectedDatabaseReset: true, historicalBackup: true
   }, null, 2));
 }
 

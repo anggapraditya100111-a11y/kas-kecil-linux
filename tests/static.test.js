@@ -112,9 +112,27 @@ test('UMO menyediakan PDF tanda terima pencairan', () => {
   assert.match(server, /TANDA TERIMA UANG MUKA OPERASIONAL/);
 });
 
+test('rekap dana per akun menyediakan filter dan export', () => {
+  assert.match(client, /Rekap Dana per Akun/);
+  assert.match(client, /account-summary-start/);
+  assert.match(client, /reports\/account-summary/);
+  assert.match(server, /queryAccountSummary/);
+  assert.match(server, /account_summary\.export/);
+  assert.match(server, /t\.status='APPROVED'/);
+});
+
+test('reset database dilindungi dan selalu membuat backup historical', () => {
+  assert.match(client, /HAPUS DATA TRANSAKSI/);
+  assert.match(client, /api\/admin\/database\/clear/);
+  assert.match(server, /requireSuperUser/);
+  assert.match(server, /verifyPassword/);
+  assert.match(server, /backupDatabase\('before-clear'\)/);
+  assert.match(server, /CLEAR_DATABASE/);
+});
+
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.3\.0/);
-  assert.match(html, /app\.js\?v=1\.3\.0/);
+  assert.match(html, /styles\.css\?v=1\.4\.0/);
+  assert.match(html, /app\.js\?v=1\.4\.0/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);

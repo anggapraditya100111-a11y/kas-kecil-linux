@@ -11,6 +11,9 @@ test('SPV default dapat dashboard seluruh user dan approval, tanpa input transak
   assert.equal(permissions.has('mutations.view_all'), true);
   assert.equal(permissions.has('transfers.view_all'), true);
   assert.equal(permissions.has('umo.view_all'), true);
+  assert.equal(permissions.has('account_summary.view'), true);
+  assert.equal(permissions.has('account_summary.export'), true);
+  assert.equal(permissions.has('database.manage'), false);
 });
 
 test('Staff default hanya melihat data sendiri dan dapat input', () => {
@@ -22,6 +25,7 @@ test('Staff default hanya melihat data sendiri dan dapat input', () => {
   assert.equal(permissions.has('transfers.create'), true);
   assert.equal(permissions.has('umo.create'), true);
   assert.equal(permissions.has('corrections.create'), true);
+  assert.equal(permissions.has('account_summary.view'), false);
 });
 
 test('override pengguna mengalahkan default role', () => {
@@ -40,6 +44,12 @@ test('Super User tidak dapat kehilangan akses akibat override', () => {
   ]);
   assert.equal(permissions.has('users.manage'), true);
   assert.equal(permissions.has('permissions.manage'), true);
+  assert.equal(permissions.has('database.manage'), true);
+});
+
+test('izin reset database tidak dapat diberikan kepada non-Super User', () => {
+  const permissions = effectivePermissions('SPV', [{ permission_code: 'database.manage', allowed: 1 }]);
+  assert.equal(permissions.has('database.manage'), false);
 });
 
 test('password hash memakai salt dan dapat diverifikasi', () => {
