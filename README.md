@@ -2,6 +2,11 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.5.1
+
+- Restore `.kkbackup` mendukung volume database dan upload yang terpasang terpisah di Docker.
+- Lampiran dipulihkan melalui area swap di dalam volume upload, tanpa memindahkan folder mount dan dengan rollback otomatis jika proses gagal.
+
 ## Fitur utama
 
 - Pencatatan kas masuk dan kas keluar dengan bukti transaksi.

@@ -51,7 +51,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.5.1';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
 const DEFAULT_COMPANY_NAME = process.env.DEFAULT_COMPANY_NAME || 'Nama Perusahaan';
@@ -2071,6 +2071,81 @@ function validateRestorePayload(payload, stageDir) {
   return { candidateDb, uploadsDir };
 }
 
+function prepareUploadRestore(stagedUploadsDir) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  const swapName = `.restore-swap-${crypto.randomUUID()}`;
+  const swapDir = path.join(UPLOAD_DIR, swapName);
+  const nextDir = path.join(swapDir, 'next');
+  const previousDir = path.join(swapDir, 'previous');
+  fs.mkdirSync(nextDir, { recursive: true });
+  fs.mkdirSync(previousDir, { recursive: true });
+
+  for (const entry of fs.readdirSync(stagedUploadsDir, { withFileTypes: true })) {
+    if (!entry.isFile()) throw new AppError('Isi lampiran dalam backup tidak valid.');
+    fs.copyFileSync(path.join(stagedUploadsDir, entry.name), path.join(nextDir, entry.name));
+  }
+
+  let applied = false;
+  const cleanupSwap = () => {
+    try { fs.rmSync(swapDir, { recursive: true, force: true }); } catch (ignored) {}
+  };
+  const moveBackPrevious = () => {
+    if (!fs.existsSync(previousDir)) return;
+    for (const entry of fs.readdirSync(previousDir, { withFileTypes: true })) {
+      const destination = path.join(UPLOAD_DIR, entry.name);
+      if (fs.existsSync(destination)) fs.rmSync(destination, { recursive: true, force: true });
+      fs.renameSync(path.join(previousDir, entry.name), destination);
+    }
+  };
+
+  return {
+    apply() {
+      const originalNames = fs.readdirSync(UPLOAD_DIR).filter(name => name !== swapName);
+      const replacementNames = fs.readdirSync(nextDir);
+      const movedOriginal = [];
+      const movedReplacement = [];
+      try {
+        for (const name of originalNames) {
+          fs.renameSync(path.join(UPLOAD_DIR, name), path.join(previousDir, name));
+          movedOriginal.push(name);
+        }
+        for (const name of replacementNames) {
+          fs.renameSync(path.join(nextDir, name), path.join(UPLOAD_DIR, name));
+          movedReplacement.push(name);
+        }
+        applied = true;
+      } catch (error) {
+        for (const name of movedReplacement.reverse()) {
+          const installed = path.join(UPLOAD_DIR, name);
+          if (fs.existsSync(installed)) fs.rmSync(installed, { recursive: true, force: true });
+        }
+        for (const name of movedOriginal.reverse()) {
+          const previous = path.join(previousDir, name);
+          if (fs.existsSync(previous)) fs.renameSync(previous, path.join(UPLOAD_DIR, name));
+        }
+        cleanupSwap();
+        throw error;
+      }
+    },
+    rollback() {
+      if (!applied) {
+        cleanupSwap();
+        return;
+      }
+      for (const name of fs.readdirSync(UPLOAD_DIR).filter(name => name !== swapName)) {
+        fs.rmSync(path.join(UPLOAD_DIR, name), { recursive: true, force: true });
+      }
+      moveBackPrevious();
+      applied = false;
+      cleanupSwap();
+    },
+    commit() {
+      applied = false;
+      cleanupSwap();
+    }
+  };
+}
+
 const fullBackupUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 250 * 1024 * 1024 },
@@ -2100,12 +2175,12 @@ app.post('/api/admin/full-backup/restore', authMiddleware, requireSuperUser, ful
   const payload = decryptedBackupPayload(req.file.buffer, password);
   const stageDir = path.join(DATA_DIR, `restore-${crypto.randomUUID()}`);
   const staged = validateRestorePayload(payload, stageDir);
+  const uploadRestore = prepareUploadRestore(staged.uploadsDir);
   const current = createFullBackupBuffer(password, req.auth.user.id, 'before-restore');
   const beforeRestoreName = `kas-kecil-full-before-restore-${current.stamp}.kkbackup`;
   fs.writeFileSync(path.join(BACKUP_DIR, beforeRestoreName), current.buffer);
 
   const oldDatabase = `${DB_PATH}.pre-restore`;
-  const oldUploads = `${UPLOAD_DIR}.pre-restore`;
   const previousPepper = fs.existsSync(RESTORED_PEPPER_PATH) ? fs.readFileSync(RESTORED_PEPPER_PATH) : null;
   try {
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
@@ -2115,22 +2190,19 @@ app.post('/api/admin/full-backup/restore', authMiddleware, requireSuperUser, ful
     }
     if (fs.existsSync(DB_PATH)) fs.renameSync(DB_PATH, oldDatabase);
     fs.renameSync(staged.candidateDb, DB_PATH);
-    if (fs.existsSync(oldUploads)) fs.rmSync(oldUploads, { recursive: true, force: true });
-    if (fs.existsSync(UPLOAD_DIR)) fs.renameSync(UPLOAD_DIR, oldUploads);
-    fs.renameSync(staged.uploadsDir, UPLOAD_DIR);
+    uploadRestore.apply();
     installRestoredAppPepper(payload.security.appPepper);
+    uploadRestore.commit();
     fs.rmSync(stageDir, { recursive: true, force: true });
+    try { if (fs.existsSync(oldDatabase)) fs.unlinkSync(oldDatabase); } catch (ignored) {}
     res.json({ ok: true, restarting: true, restoredFrom: payload.manifest.createdAt, beforeRestoreBackup: beforeRestoreName });
     setTimeout(() => process.exit(0), 500);
   } catch (error) {
     try {
+      uploadRestore.rollback();
       if (fs.existsSync(oldDatabase)) {
         if (fs.existsSync(DB_PATH)) fs.unlinkSync(DB_PATH);
         fs.renameSync(oldDatabase, DB_PATH);
-      }
-      if (fs.existsSync(oldUploads)) {
-        if (fs.existsSync(UPLOAD_DIR)) fs.rmSync(UPLOAD_DIR, { recursive: true, force: true });
-        fs.renameSync(oldUploads, UPLOAD_DIR);
       }
       if (previousPepper) fs.writeFileSync(RESTORED_PEPPER_PATH, previousPepper, { mode: 0o600 });
       else if (fs.existsSync(RESTORED_PEPPER_PATH)) fs.unlinkSync(RESTORED_PEPPER_PATH);

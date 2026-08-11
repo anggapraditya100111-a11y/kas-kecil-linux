@@ -1,5 +1,5 @@
 Kas Kecil untuk CasaOS dan Linux
-Versi: 1.5.0
+Versi: 1.5.1
 Tanggal: 2026-08-12
 Arsitektur: amd64
 Port default: 8090

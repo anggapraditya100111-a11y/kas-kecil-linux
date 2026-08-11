@@ -90,11 +90,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.5.0');
+  assert.equal(health.version, '1.5.1');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.5.0', '/styles.css?v=1.5.0']) {
+  for (const asset of ['/app.js?v=1.5.1', '/styles.css?v=1.5.1']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -326,7 +326,7 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.5.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.5.1', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,

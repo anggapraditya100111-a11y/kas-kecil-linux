@@ -5,13 +5,19 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'kas-kecil-restore-v15-'));
+let uploadRuntime = path.join(runtime, 'uploads');
+try {
+  if (fs.statSync('/dev/shm').dev !== fs.statSync(os.tmpdir()).dev) {
+    uploadRuntime = fs.mkdtempSync(path.join('/dev/shm', 'kas-kecil-restore-uploads-v15-'));
+  }
+} catch {}
 const port = '18091';
 const baseUrl = `http://127.0.0.1:${port}`;
 const env = {
   ...process.env,
   PORT: port,
   DATA_DIR: path.join(runtime, 'data'),
-  UPLOAD_DIR: path.join(runtime, 'uploads'),
+  UPLOAD_DIR: uploadRuntime,
   BACKUP_DIR: path.join(runtime, 'backups'),
   APP_PEPPER: 'restore-integration-secret-v15-1234567890',
   INITIAL_ADMIN_PASSWORD: 'Admin12345',
@@ -60,6 +66,7 @@ try {
   await waitForHealth();
   let cookie = await login();
   await jsonRequest('/api/admin/users', cookie, 'POST', { name: 'Pengguna Dipulihkan', username: 'restored.user', password: 'Restore12345', role: 'STAFF' });
+  fs.writeFileSync(path.join(env.UPLOAD_DIR, 'lampiran-dipulihkan.txt'), 'lampiran dari backup');
 
   const exported = await fetch(`${baseUrl}/api/admin/full-backup/export`, {
     method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' },
@@ -70,6 +77,8 @@ try {
   assert(backup.toString('utf8', 0, 10).startsWith('KKBACKUP1'));
 
   await jsonRequest('/api/admin/users', cookie, 'POST', { name: 'Pengguna Sementara', username: 'temporary.user', password: 'Temporary12345', role: 'STAFF' });
+  fs.unlinkSync(path.join(env.UPLOAD_DIR, 'lampiran-dipulihkan.txt'));
+  fs.writeFileSync(path.join(env.UPLOAD_DIR, 'lampiran-sementara.txt'), 'harus hilang setelah restore');
   const form = new FormData();
   form.set('backupFile', new Blob([backup], { type: 'application/octet-stream' }), 'restore-test.kkbackup');
   form.set('currentPassword', 'Admin12345');
@@ -88,9 +97,12 @@ try {
   const users = await jsonRequest('/api/admin/users', cookie);
   assert(users.users.some(user => user.username === 'restored.user'));
   assert(!users.users.some(user => user.username === 'temporary.user'));
+  assert.equal(fs.readFileSync(path.join(env.UPLOAD_DIR, 'lampiran-dipulihkan.txt'), 'utf8'), 'lampiran dari backup');
+  assert(!fs.existsSync(path.join(env.UPLOAD_DIR, 'lampiran-sementara.txt')));
   assert(fs.readdirSync(env.BACKUP_DIR).some(name => /^kas-kecil-full-before-restore-.*\.kkbackup$/.test(name)));
-  console.log(JSON.stringify({ checks: 'passed', fullRestoreRoundTrip: true }, null, 2));
+  console.log(JSON.stringify({ checks: 'passed', fullRestoreRoundTrip: true, crossVolumeUploads: uploadRuntime !== path.join(runtime, 'uploads') }, null, 2));
 } finally {
   await stopServer(child);
   fs.rmSync(runtime, { recursive: true, force: true });
+  if (uploadRuntime !== path.join(runtime, 'uploads')) fs.rmSync(uploadRuntime, { recursive: true, force: true });
 }
