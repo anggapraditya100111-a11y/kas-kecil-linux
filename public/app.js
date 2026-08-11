@@ -6,21 +6,26 @@ const state = {
   accounts: [],
   approvalCount: 0,
   currentPage: '',
+  openGroups: new Set(),
   loadingCount: 0,
-  userOptions: []
+  userOptions: [],
+  budget: null,
+  openPeriod: null
 };
 
 const pages = [
   { id: 'dashboard', label: 'Dashboard', group: 'Utama', any: ['dashboard.view'] },
+  { id: 'budget', label: 'Pagu Kas', group: 'Utama', any: ['budgets.view'] },
   { id: 'transaction', label: 'Input Transaksi', group: 'Utama', any: ['transactions.create'] },
   { id: 'ledger', label: 'Buku Kas', group: 'Utama', any: ['ledger.view_self', 'ledger.view_all'] },
-  { id: 'mutations', label: 'Mutasi Kas', group: 'Utama', any: ['mutations.view_self', 'mutations.view_all'] },
-  { id: 'account-list', label: 'Daftar Akun', group: 'Utama', any: ['accounts.view'] },
   { id: 'transfers', label: 'Transfer Kas', group: 'Utama', any: ['transfers.create', 'transfers.view_self', 'transfers.view_all'] },
   { id: 'umo', label: 'Uang Muka Operasional', group: 'Utama', any: ['umo.create', 'umo.view_self', 'umo.view_all'] },
   { id: 'corrections', label: 'Koreksi Transaksi', group: 'Utama', any: ['corrections.create', 'corrections.view_all'] },
   { id: 'approval', label: 'Approval', group: 'Utama', any: ['approvals.view'], badge: true },
+  { id: 'mutations', label: 'Mutasi Kas', group: 'Laporan', any: ['mutations.view_self', 'mutations.view_all'] },
   { id: 'account-summary', label: 'Rekap Dana per Akun', group: 'Laporan', any: ['account_summary.view'] },
+  { id: 'account-comparison', label: 'Perbandingan Dana per Akun', group: 'Laporan', any: ['account_comparison.view'] },
+  { id: 'account-list', label: 'Daftar Akun', group: 'Laporan', any: ['accounts.view'] },
   { id: 'users', label: 'Pengguna', group: 'Super User', any: ['users.manage'] },
   { id: 'access', label: 'Hak Akses', group: 'Super User', any: ['permissions.manage'] },
   { id: 'accounts', label: 'Akun Kas', group: 'Super User', any: ['accounts.manage'] },
@@ -71,6 +76,11 @@ async function renderPublicApproval() {
       ? `<div class="public-receipt"><img src="${escapeHtml(row.receiptUrl)}" alt="Bukti transaksi"></div>`
       : `<div class="public-receipt"><iframe src="${escapeHtml(row.receiptUrl)}" title="Bukti transaksi"></iframe><a class="btn btn-ghost" href="${escapeHtml(row.receiptUrl)}" target="_blank" rel="noopener">Buka bukti</a></div>`)
     : '<div class="notice warn">Transaksi ini tidak memiliki bukti yang dapat ditampilkan.</div>';
+  const underlying = row.underlyingUrl
+    ? (String(row.underlyingMime).startsWith('image/')
+      ? `<div class="public-receipt"><img src="${escapeHtml(row.underlyingUrl)}" alt="Underlying document"></div>`
+      : `<div class="public-receipt"><iframe src="${escapeHtml(row.underlyingUrl)}" title="Underlying document"></iframe><a class="btn btn-ghost" href="${escapeHtml(row.underlyingUrl)}" target="_blank" rel="noopener">Buka underlying document</a></div>`)
+    : '<div class="notice warn">Tidak ada underlying document.</div>';
   page.innerHTML = `
     <div class="page-head"><div><h2>${escapeHtml(row.title || 'Detail Approval')}</h2><p>${escapeHtml(row.referenceNo || row.transactionNo)}</p></div>${statusHtml(row.decision)}</div>
     ${row.expired ? '<div class="notice warn">Tautan approval sudah kedaluwarsa.</div>' : ''}
@@ -84,6 +94,7 @@ async function renderPublicApproval() {
       ${row.dueDate ? `<p><strong>Batas pertanggungjawaban:</strong> ${escapeHtml(row.dueDate)}</p>` : ''}
       <p><strong>Keterangan:</strong><br>${escapeHtml(row.description || '-')}</p></div>
       <h3>Bukti transaksi</h3>${receipt}
+      ${row.entityType === 'TRANSACTION' ? `<h3 style="margin-top:18px">Underlying document</h3>${underlying}` : ''}
     </div>
     ${unavailable ? '' : `<div class="card approval-pin-card"><h3>Keputusan SPV</h3><p class="muted">Masukkan PIN approval 8 digit. Identitas approver akan dikenali dari PIN tersebut.</p>
       <div class="field"><label for="public-pin">PIN approval</label><input id="public-pin" type="password" inputmode="numeric" pattern="[0-9]{8}" maxlength="8" autocomplete="one-time-code" placeholder="8 digit" required></div>
@@ -125,8 +136,11 @@ async function api(url, options = {}) {
   return payload;
 }
 
-async function apiBlob(url) {
-  const response = await fetch(url, { credentials: 'same-origin' });
+async function apiBlob(url, options = {}) {
+  const request = { method: options.method || 'GET', headers: { ...(options.headers || {}) }, credentials: 'same-origin' };
+  if (options.body instanceof FormData) request.body = options.body;
+  else if (options.body !== undefined) { request.headers['Content-Type'] = 'application/json'; request.body = JSON.stringify(options.body); }
+  const response = await fetch(url, request);
   if (!response.ok) {
     let message = 'File gagal dibuat.';
     try { message = (await response.json()).error || message; } catch {}
@@ -158,11 +172,14 @@ async function bootstrap() {
   state.permissions = new Set(data.permissions || []);
   state.config = data.config || {};
   state.accounts = data.accounts || [];
+  state.budget = data.budget || null;
+  state.openPeriod = data.openPeriod || null;
   state.approvalCount = Number(data.approvalCount || 0);
   text('app-name', state.config.appName);
   text('company-name', state.config.companyName);
   text('user-name', state.user.name);
   text('user-role', roleLabel(state.user.role));
+  text('sidebar-version', `Versi ${state.config.appVersion || '-'}`);
   applyBranding(state.config);
   renderNavigation();
 }
@@ -175,24 +192,44 @@ function allowedPage(pageId) {
 function firstAllowedPage() { return pages.find(page => allowedPage(page.id)).id; }
 
 function renderNavigation() {
-  let currentGroup = '';
-  const html = pages.filter(page => allowedPage(page.id)).map(page => {
-    let section = '';
-    if (page.group !== currentGroup) { currentGroup = page.group; section = `<div class="nav-section">${escapeHtml(currentGroup)}</div>`; }
-    const badge = page.badge && state.approvalCount ? `<span class="badge">${state.approvalCount}</span>` : '';
-    return `${section}<button class="nav-btn" data-page="${page.id}"><span>${escapeHtml(page.label)}</span>${badge}</button>`;
+  const visible = pages.filter(page => allowedPage(page.id));
+  const grouped = visible.reduce((groups, page) => {
+    if (!groups.has(page.group)) groups.set(page.group, []);
+    groups.get(page.group).push(page);
+    return groups;
+  }, new Map());
+  const html = [...grouped.entries()].map(([group, items]) => {
+    const open = state.openGroups.has(group);
+    const badgeCount = items.some(page => page.badge) ? state.approvalCount : 0;
+    return `<section class="nav-group ${open ? 'open' : ''}">
+      <button class="nav-group-toggle" type="button" data-nav-group="${escapeHtml(group)}" aria-expanded="${open}">
+        <span>${escapeHtml(group)}</span><span class="nav-group-meta">${badgeCount ? `<span class="badge">${badgeCount}</span>` : ''}<span class="nav-arrow">⌄</span></span>
+      </button>
+      <div class="nav-submenu" ${open ? '' : 'hidden'}>${items.map(page => {
+        const badge = page.badge && state.approvalCount ? `<span class="badge">${state.approvalCount}</span>` : '';
+        return `<button class="nav-btn ${state.currentPage === page.id ? 'active' : ''}" data-page="${page.id}"><span>${escapeHtml(page.label)}</span>${badge}</button>`;
+      }).join('')}</div>
+    </section>`;
   }).join('');
   const nav = document.getElementById('navigation');
   nav.innerHTML = html;
+  nav.querySelectorAll('[data-nav-group]').forEach(button => button.addEventListener('click', () => {
+    const group = button.dataset.navGroup;
+    if (state.openGroups.has(group)) state.openGroups.delete(group); else state.openGroups.add(group);
+    renderNavigation();
+  }));
   nav.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => { closeMobileNavigation(); openPage(button.dataset.page); }));
 }
 
 async function openPage(pageId) {
   if (!allowedPage(pageId)) return toast('Anda tidak memiliki akses ke menu tersebut.', true);
   state.currentPage = pageId;
-  document.querySelectorAll('.nav-btn').forEach(button => button.classList.toggle('active', button.dataset.page === pageId));
+  const activePage = pages.find(page => page.id === pageId);
+  if (activePage) state.openGroups.add(activePage.group);
+  renderNavigation();
   const renderers = { dashboard: renderDashboard, transaction: renderTransaction, ledger: renderLedger, mutations: renderMutations,
-    'account-list': renderAccountList, 'account-summary': renderAccountSummary, transfers: renderTransfers, umo: renderUmo, corrections: renderCorrections,
+    budget: renderBudget, 'account-list': renderAccountList, 'account-summary': renderAccountSummary, 'account-comparison': renderAccountComparison,
+    transfers: renderTransfers, umo: renderUmo, corrections: renderCorrections,
     approval: renderApproval, users: renderUsers, access: renderAccess, accounts: renderAccounts, settings: renderSettings,
     database: renderDatabaseMaintenance, audit: renderAudit, profile: renderProfile };
   setLoading(true);
@@ -201,15 +238,22 @@ async function openPage(pageId) {
   finally { setLoading(false); }
 }
 
-async function renderDashboard(userId = 'ALL') {
-  const data = await api(`/api/dashboard?userId=${encodeURIComponent(userId)}`);
+async function renderDashboard(userId = 'ALL', startDate = '', endDate = '') {
+  const query = new URLSearchParams({ userId, startDate, endDate });
+  [...query.keys()].forEach(key => { if (!query.get(key)) query.delete(key); });
+  const data = await api(`/api/dashboard?${query}`);
   state.userOptions = data.userOptions || [];
   const selector = data.canViewAll ? `
-    <div style="min-width:250px"><label for="dashboard-user">Tampilkan data</label><select id="dashboard-user"><option value="ALL">Seluruh pengguna</option>${data.userOptions.map(user => `<option value="${escapeHtml(user.userId)}" ${data.scope === user.userId ? 'selected' : ''}>${escapeHtml(user.name)} — ${escapeHtml(roleLabel(user.role))}</option>`).join('')}</select></div>` : '';
+    <div class="field"><label for="dashboard-user">Tampilkan data</label><select id="dashboard-user"><option value="ALL">Seluruh pengguna</option>${data.userOptions.map(user => `<option value="${escapeHtml(user.userId)}" ${data.scope === user.userId ? 'selected' : ''}>${escapeHtml(user.name)} — ${escapeHtml(roleLabel(user.role))}</option>`).join('')}</select></div>` : '';
   document.getElementById('page').innerHTML = `
-    <div class="page-head"><div><h2>Dashboard</h2><p>${data.canViewAll ? 'Ringkasan dapat dilihat seluruhnya atau difilter per pengguna.' : 'Ringkasan transaksi yang dibuat oleh akun Anda.'}</p></div>${selector}</div>
+    <div class="page-head"><div><h2>Dashboard</h2><p>${data.canViewAll ? 'Ringkasan dapat dilihat seluruhnya atau difilter per pengguna.' : 'Ringkasan transaksi yang dibuat oleh akun Anda.'}</p></div></div>
+    <div class="card"><form id="dashboard-filter" class="grid-4">${selector}
+      <div class="field"><label for="dashboard-start">Dari tanggal</label><input id="dashboard-start" type="date" value="${escapeHtml(data.startDate)}"></div>
+      <div class="field"><label for="dashboard-end">Sampai tanggal</label><input id="dashboard-end" type="date" value="${escapeHtml(data.endDate)}"></div>
+      <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Terapkan</button></div>
+    </form></div>
     <div class="grid-3">
-      <div class="card metric"><span>Saldo kas berjalan</span><strong>${money(data.cashBalance)}</strong></div>
+      <div class="card metric"><span>Saldo kas sampai ${escapeHtml(data.endDate)}</span><strong>${money(data.cashBalance)}</strong></div>
       <div class="card metric pending"><span>UMO belum dipertanggungjawabkan</span><strong>${money(data.umoOutstanding)}</strong></div>
       <div class="card metric in"><span>Kas masuk approved</span><strong>${money(data.totalIn)}</strong></div>
       <div class="card metric out"><span>Kas keluar approved</span><strong>${money(data.totalOut)}</strong></div>
@@ -218,8 +262,11 @@ async function renderDashboard(userId = 'ALL') {
     </div>
     ${data.canViewAll ? `<div class="card"><h3>Ringkasan per pengguna</h3>${perUserTable(data.perUser)}</div>` : ''}
     <div class="card"><h3>10 transaksi terbaru</h3>${transactionTable(data.recent || [], false)}</div>`;
-  const select = document.getElementById('dashboard-user');
-  if (select) select.addEventListener('change', () => renderDashboard(select.value).catch(error => toast(error.message, true)));
+  document.getElementById('dashboard-filter').addEventListener('submit', event => {
+    event.preventDefault();
+    const selectedUser = document.getElementById('dashboard-user') ? value('dashboard-user') : 'ALL';
+    renderDashboard(selectedUser, value('dashboard-start'), value('dashboard-end')).catch(error => toast(error.message, true));
+  });
 }
 
 function perUserTable(rows) {
@@ -227,25 +274,110 @@ function perUserTable(rows) {
   return `<div class="table-wrap"><table><thead><tr><th>Pengguna</th><th>Role</th><th>Saldo Kas</th><th>UMO Terbuka</th><th>Transaksi</th><th>Kas Masuk</th><th>Kas Keluar</th><th>Pending</th></tr></thead><tbody>${rows.map(row => `<tr><td><strong>${escapeHtml(row.name)}</strong><br><span class="muted">${escapeHtml(row.username)}</span></td><td>${escapeHtml(roleLabel(row.role))}</td><td class="amount">${money(row.cashBalance)}</td><td class="amount">${money(row.umoOutstanding)}</td><td>${row.transactionCount}</td><td class="amount">${money(row.totalIn)}</td><td class="amount">${money(row.totalOut)}</td><td>${row.pendingCount}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
+async function renderBudget(periodMonth = '') {
+  const query = periodMonth ? `?periodMonth=${encodeURIComponent(periodMonth)}` : '';
+  const data = await api(`/api/budgets/current${query}`);
+  state.budget = data.periodMonth === data.openPeriodMonth ? data : state.budget;
+  const editable = data.canManage && data.periodStatus === 'OPEN';
+  const periodOptions = data.periods.map(period => `<option value="${escapeHtml(period.periodMonth)}" ${period.periodMonth === data.periodMonth ? 'selected' : ''}>${escapeHtml(monthLabel(period.periodMonth))} — ${escapeHtml(period.status)}</option>`).join('');
+  const allocationRows = data.allocations.map(row => `<tr>
+    <td><strong>${escapeHtml(row.accountCode)}</strong><br><span class="muted">${escapeHtml(row.accountName)}</span></td>
+    <td>${editable ? `<input class="budget-percentage" data-budget-account="${escapeHtml(row.accountId)}" type="number" min="0" max="100" step="0.01" value="${row.percentage}">` : `${Number(row.percentage).toLocaleString('id-ID')}%`}</td>
+    <td class="amount">${money(row.allocatedAmount)}</td><td class="amount amount-out">${money(row.usedAmount)}</td>
+    <td class="amount">${money(row.pendingAmount)}</td><td class="amount ${row.remainingAmount < 0 ? 'amount-out' : 'amount-in'}">${money(row.remainingAmount)}</td>
+  </tr>`).join('');
+  document.getElementById('page').innerHTML = `
+    <div class="page-head"><div><h2>Pagu Kas</h2><p>Pagu bulanan merupakan informasi dan pengingat; transaksi tetap dapat diajukan saat pagu terlampaui.</p></div>
+      <div class="field"><label>Periode</label><select id="budget-period">${periodOptions}</select></div></div>
+    ${data.openPeriodMonth !== data.currentCalendarMonth ? `<div class="notice warn"><strong>Periode terbuka masih ${escapeHtml(monthLabel(data.openPeriodMonth))}.</strong> Transaksi bulan baru terkunci sampai End of Month diselesaikan.</div>` : ''}
+    <div class="grid-4 summary-metrics">
+      <div class="card metric"><span>Total pagu</span><strong>${money(data.totalBudget)}</strong></div>
+      <div class="card metric out"><span>Terpakai approved</span><strong>${money(data.totals.usedAmount)}</strong></div>
+      <div class="card metric pending"><span>Masih pending</span><strong>${money(data.totals.pendingAmount)}</strong></div>
+      <div class="card metric in"><span>Sisa pagu</span><strong>${money(data.totals.remainingAmount)}</strong></div>
+    </div>
+    <div class="card"><form id="budget-form">
+      ${editable ? `<div class="grid-2"><div class="field"><label>Total pagu kas bulan ini</label><input id="budget-total" class="money-input" type="text" inputmode="numeric" value="${formatMoneyInput(data.totalBudget)}" required></div>
+        <div class="notice"><strong>Total persentase:</strong> <span id="budget-percentage-total">${data.allocations.reduce((sum, row) => sum + row.percentage, 0).toLocaleString('id-ID')}%</span></div></div>` : ''}
+      <div class="table-wrap"><table><thead><tr><th>Kode/Nama Akun</th><th>Persentase</th><th>Alokasi</th><th>Terpakai</th><th>Pending</th><th>Sisa</th></tr></thead><tbody>${allocationRows || `<tr><td colspan="6">Belum ada akun Kas Keluar aktif.</td></tr>`}</tbody></table></div>
+      ${editable ? '<div class="actions" style="margin-top:14px"><button class="btn btn-primary" type="submit">Simpan Pagu Kas</button></div>' : ''}
+    </form></div>
+    ${(data.canClose || data.canReopen) ? `<div class="card"><div class="page-head"><div><h3>Periode Bulanan</h3><p>Penutupan periode memindahkan snapshot saldo akhir menjadi saldo awal periode berikutnya.</p></div>
+      ${data.canClose && data.periodStatus === 'OPEN' ? '<button id="run-eom" class="btn btn-danger">Jalankan End of Month</button>' : ''}</div>
+      ${periodHistoryTable(data.periods, data.canReopen)}</div>` : ''}`;
+  document.getElementById('budget-period').addEventListener('change', event => renderBudget(event.target.value));
+  if (editable) {
+    document.getElementById('budget-form').addEventListener('submit', saveBudget);
+    document.querySelectorAll('.budget-percentage').forEach(input => input.addEventListener('input', updateBudgetPercentageTotal));
+  }
+  document.getElementById('run-eom')?.addEventListener('click', runEndOfMonth);
+  document.querySelectorAll('[data-reopen-period]').forEach(button => button.addEventListener('click', () => reopenPeriod(button.dataset.reopenPeriod)));
+}
+
+function updateBudgetPercentageTotal() {
+  const total = [...document.querySelectorAll('.budget-percentage')].reduce((sum, input) => sum + Number(String(input.value).replace(',', '.') || 0), 0);
+  const target = document.getElementById('budget-percentage-total');
+  if (target) target.textContent = `${total.toLocaleString('id-ID', { maximumFractionDigits: 2 })}%`;
+}
+
+async function saveBudget(event) {
+  event.preventDefault();
+  const allocations = [...document.querySelectorAll('.budget-percentage')].map(input => ({
+    accountId: input.dataset.budgetAccount,
+    percentageBps: Math.round(Number(String(input.value).replace(',', '.') || 0) * 100)
+  }));
+  setLoading(true);
+  try {
+    await api(`/api/budgets/${encodeURIComponent(value('budget-period'))}`, { method: 'PUT', body: { totalBudget: parseMoney(value('budget-total')), allocations } });
+    toast('Pagu kas berhasil disimpan.'); await bootstrap(); await renderBudget(value('budget-period'));
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+function periodHistoryTable(periods, canReopen) {
+  if (!periods.length) return empty('Belum ada riwayat periode.');
+  return `<div class="table-wrap"><table><thead><tr><th>Periode</th><th>Status</th><th>Pagu</th><th>Dibuka</th><th>Ditutup</th><th>Aksi</th></tr></thead><tbody>${periods.map(period => `<tr><td>${escapeHtml(monthLabel(period.periodMonth))}</td><td>${statusHtml(period.status)}</td><td>${period.hasBudget ? 'Ada' : '-'}</td><td>${escapeHtml(formatDateTime(period.openedAt))}</td><td>${escapeHtml(formatDateTime(period.closedAt))}</td><td>${canReopen && period.status === 'CLOSED' ? `<button class="btn btn-sm" data-reopen-period="${escapeHtml(period.periodMonth)}">Buka kembali</button>` : '-'}</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+async function runEndOfMonth() {
+  if (!confirm('Tutup periode ini dan buat periode bulan berikutnya? Data periode yang ditutup tidak dapat diubah.')) return;
+  const note = prompt('Catatan End of Month (opsional):') || '';
+  setLoading(true);
+  try { const result = await api('/api/periods/eom', { method: 'POST', body: { note } }); toast(`EOM ${result.closedPeriodMonth} selesai.`); await bootstrap(); await renderBudget(); }
+  catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+async function reopenPeriod(periodMonth) {
+  const currentPassword = prompt('Masukkan password Super User:');
+  if (!currentPassword) return;
+  const reason = prompt('Alasan membuka kembali periode (wajib):');
+  if (!reason) return;
+  setLoading(true);
+  try { await api(`/api/periods/${encodeURIComponent(periodMonth)}/reopen`, { method: 'POST', body: { currentPassword, reason } }); toast(`Periode ${periodMonth} dibuka kembali.`); await bootstrap(); await renderBudget(periodMonth); }
+  catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
 function renderTransaction() {
   document.getElementById('page').innerHTML = `
     <div class="page-head"><div><h2>Input Transaksi</h2><p>Menu ini hanya tampil untuk pengguna yang diberi izin input transaksi.</p></div></div>
     <div class="card">
+      <div class="notice">Periode transaksi aktif: <strong>${escapeHtml(monthLabel(state.openPeriod?.periodMonth || ''))}</strong>.</div>
       ${state.accounts.length ? '' : '<div class="notice warn">Belum ada akun kas aktif. Hubungi Super User.</div>'}
       <form id="transaction-form">
         <div class="grid-3">
           <div class="field"><label for="tx-type">Jenis transaksi</label><select id="tx-type" name="type"><option value="KELUAR">Kas Keluar</option><option value="MASUK">Kas Masuk</option></select></div>
           <div class="field"><label for="tx-date">Tanggal</label><input id="tx-date" name="transactionDate" type="date" value="${todayInput()}" required></div>
-          <div class="field"><label for="tx-account">Akun</label><select id="tx-account" name="accountId" required></select></div>
+          <div class="field"><label for="tx-account">Akun</label><select id="tx-account" name="accountId" required></select><small id="tx-account-info" class="muted"></small></div>
         </div>
         <div class="grid-2"><div class="field"><label for="tx-amount">Nominal (Rp)</label><input id="tx-amount" class="money-input" name="amount" type="text" inputmode="numeric" autocomplete="off" placeholder="0" required><small class="muted">Pemisah ribuan tampil otomatis, contoh: 1.000.000</small></div><div class="field"><label for="tx-counterparty">Pihak terkait</label><input id="tx-counterparty" name="counterparty" maxlength="150"></div></div>
         <div class="field"><label for="tx-description">Keterangan</label><textarea id="tx-description" name="description" maxlength="500" required></textarea></div>
         ${receiptPicker('tx-receipt', `Bukti transaksi (maks. ${state.config.maxUploadMb} MB)`)}
+        ${receiptPicker('tx-underlying', `Underlying document dasar pengeluaran, gambar/PDF (maks. ${state.config.maxUploadMb} MB)`, 'underlyingDocument')}
         <div id="tx-result"></div><button class="btn btn-primary" type="submit" ${state.accounts.length ? '' : 'disabled'}>Simpan transaksi</button>
       </form>
     </div>`;
   const type = document.getElementById('tx-type');
   type.addEventListener('change', updateAccountOptions);
+  document.getElementById('tx-account').addEventListener('change', updateTransactionAccountInfo);
   updateAccountOptions();
   bindReceiptPickers(document.getElementById('transaction-form'));
   document.getElementById('transaction-form').addEventListener('submit', submitTransaction);
@@ -255,6 +387,17 @@ function updateAccountOptions() {
   const type = value('tx-type');
   const accounts = state.accounts.filter(account => account.transactionScope === 'BOTH' || account.transactionScope === type);
   document.getElementById('tx-account').innerHTML = `<option value="">Pilih akun...</option>${accounts.map(account => `<option value="${escapeHtml(account.accountId)}">${escapeHtml(account.accountCode)} — ${escapeHtml(account.accountName)} (limit ${money(account.approvalLimit)})</option>`).join('')}`;
+  updateTransactionAccountInfo();
+}
+
+function updateTransactionAccountInfo() {
+  const account = state.accounts.find(item => item.accountId === (document.getElementById('tx-account')?.value || ''));
+  const target = document.getElementById('tx-account-info');
+  if (!target) return;
+  if (!account) { target.textContent = ''; return; }
+  const budget = state.budget?.allocations?.find(item => item.accountId === account.accountId);
+  const requirements = [account.receiptRequired ? 'bukti wajib' : 'bukti opsional', account.underlyingRequired ? 'underlying document wajib' : 'underlying document opsional'];
+  target.textContent = `${requirements.join(' • ')}${budget ? ` • sisa pagu ${money(budget.remainingAmount)} (pending ${money(budget.pendingAmount)})` : ' • pagu belum ditetapkan'}`;
 }
 
 async function submitTransaction(event) {
@@ -263,11 +406,13 @@ async function submitTransaction(event) {
     const form = new FormData(event.target);
     form.set('amount', String(parseMoney(value('tx-amount'))));
     form.delete('receipt');
+    form.delete('underlyingDocument');
     const receipt = selectedReceipt('tx-receipt'); if (receipt) form.set('receipt', receipt);
+    const underlying = selectedReceipt('tx-underlying'); if (underlying) form.set('underlyingDocument', underlying);
     const result = await api('/api/transactions', { method: 'POST', body: form });
     document.getElementById('tx-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.transactionNo)}</strong> tersimpan dengan status <strong>${escapeHtml(result.status)}</strong>.${result.approvalUrl ? `<br><br><label>Tautan approval</label><div class="copy-row"><input id="approval-url" class="readonly-link" readonly aria-readonly="true" value="${escapeHtml(result.approvalUrl)}"><button id="copy-approval" type="button" class="btn btn-sm">Salin tautan</button></div>` : ''}</div>`;
     if (result.approvalUrl) document.getElementById('copy-approval').addEventListener('click', () => copyText(result.approvalUrl));
-    event.target.reset(); resetReceiptPicker('tx-receipt'); document.getElementById('tx-date').value = todayInput(); updateAccountOptions();
+    event.target.reset(); resetReceiptPicker('tx-receipt'); resetReceiptPicker('tx-underlying'); document.getElementById('tx-date').value = todayInput(); updateAccountOptions();
     await bootstrap();
   } catch (error) { toast(error.message, true); }
   finally { setLoading(false); }
@@ -423,6 +568,31 @@ async function exportAccountSummary(format) {
   finally { setLoading(false); }
 }
 
+async function renderAccountComparison(month1 = '', month2 = '', userId = '') {
+  const query = new URLSearchParams({ month1, month2, userId });
+  [...query.keys()].forEach(key => { if (!query.get(key)) query.delete(key); });
+  const data = await api(`/api/account-comparison?${query}`);
+  document.getElementById('page').innerHTML = `
+    <div class="page-head"><div><h2>Perbandingan Dana per Akun</h2><p>Perbandingan total transaksi approved antara dua bulan.</p></div></div>
+    <div class="card"><form id="account-comparison-filter" class="grid-4">
+      <div class="field"><label>Bulan 1</label><input id="comparison-month-1" type="month" value="${escapeHtml(data.month1)}" required></div>
+      <div class="field"><label>Bulan 2</label><input id="comparison-month-2" type="month" value="${escapeHtml(data.month2)}" required></div>
+      ${data.canViewAll ? `<div class="field"><label>Pengguna</label><select id="comparison-user"><option value="ALL">Seluruh pengguna</option>${data.users.map(user => `<option value="${escapeHtml(user.userId)}" ${data.userId === user.userId ? 'selected' : ''}>${escapeHtml(user.name)}</option>`).join('')}</select></div>` : ''}
+      <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Bandingkan</button></div>
+    </form></div>
+    <div class="card">${accountComparisonTable(data)}</div>`;
+  document.getElementById('account-comparison-filter').addEventListener('submit', event => {
+    event.preventDefault();
+    renderAccountComparison(value('comparison-month-1'), value('comparison-month-2'), document.getElementById('comparison-user') ? value('comparison-user') : '');
+  });
+}
+
+function accountComparisonTable(data) {
+  const rows = data.rows || [];
+  if (!rows.length) return empty('Belum ada akun untuk dibandingkan.');
+  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama Akun</th><th>${escapeHtml(monthLabel(data.month1))}</th><th>${escapeHtml(monthLabel(data.month2))}</th><th>Selisih</th></tr></thead><tbody>${rows.map(row => `<tr><td><strong>${escapeHtml(row.accountCode)}</strong></td><td>${escapeHtml(row.accountName)}</td><td class="amount">${money(row.month1Amount)}</td><td class="amount">${money(row.month2Amount)}</td><td class="amount ${row.difference < 0 ? 'amount-out' : row.difference > 0 ? 'amount-in' : ''}"><strong>${money(row.difference)}</strong></td></tr>`).join('')}</tbody></table></div>`;
+}
+
 async function renderAccountList() {
   const data = await api('/api/accounts');
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Daftar Akun</h2><p>Referensi akun transaksi dan batas auto-approval yang berlaku.</p></div></div><div class="card">${readOnlyAccountTable(data.accounts || [])}</div>`;
@@ -430,7 +600,7 @@ async function renderAccountList() {
 
 function readOnlyAccountTable(accounts) {
   if (!accounts.length) return empty('Belum ada akun aktif.');
-  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama akun</th><th>Jenis transaksi</th><th>Limit auto-approval</th><th>Bukti</th></tr></thead><tbody>${accounts.map(account => `<tr><td><strong>${escapeHtml(account.accountCode)}</strong></td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(typeLabel(account.transactionScope))}</td><td class="amount">${money(account.approvalLimit)}</td><td>${account.receiptRequired ? 'Wajib' : 'Opsional'}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama akun</th><th>Jenis transaksi</th><th>Limit auto-approval</th><th>Bukti</th><th>Underlying document</th></tr></thead><tbody>${accounts.map(account => `<tr><td><strong>${escapeHtml(account.accountCode)}</strong></td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(typeLabel(account.transactionScope))}</td><td class="amount">${money(account.approvalLimit)}</td><td>${account.receiptRequired ? 'Wajib' : 'Opsional'}</td><td>${account.underlyingRequired ? 'Wajib' : 'Opsional'}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function approvalResultHtml(result) {
@@ -543,7 +713,7 @@ async function renderApproval() {
   const data = await api('/api/approvals');
   state.approvalCount = data.rows.length; renderNavigation();
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Approval</h2><p>Transaksi, transfer, koreksi, dan UMO yang menunggu keputusan.</p></div></div><div class="card">${approvalTable(data.rows)}</div>`;
-  bindApprovalButtons(); bindApprovalReceiptButtons(); bindApprovalLinkButtons();
+  bindApprovalButtons(); bindApprovalReceiptButtons(); bindApprovalUnderlyingButtons(); bindApprovalLinkButtons();
 }
 
 function approvalCard(row) {
@@ -555,10 +725,11 @@ function approvalCard(row) {
 
 function approvalTable(rows) {
   if (!rows.length) return empty('Tidak ada data yang menunggu approval.');
-  return `<div class="table-wrap"><table><thead><tr><th>No./Jenis</th><th>Tanggal</th><th>Pengguna</th><th>Akun/Alur</th><th>Keterangan</th><th>Nominal</th><th>Aksi</th></tr></thead><tbody>${rows.map(row => `<tr><td><strong>${escapeHtml(row.referenceNo || row.transactionNo)}</strong><br><span class="muted">${escapeHtml(row.title || row.entityType)}</span></td><td>${escapeHtml(row.transactionDate)}</td><td>${escapeHtml(row.createdByName)}</td><td>${escapeHtml(row.accountName)}</td><td>${escapeHtml(row.description)}</td><td class="amount">${money(row.amount)}</td><td><div class="actions"><button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link</button>${row.receiptAvailable ? `<button class="btn btn-sm" data-approval-receipt="${escapeHtml(row.approvalId)}">Bukti</button>` : ''}${has('approvals.decide') ? `<button class="btn btn-success btn-sm" data-decision="APPROVED" data-approval-id="${escapeHtml(row.approvalId)}">Setujui</button><button class="btn btn-danger btn-sm" data-decision="REJECTED" data-approval-id="${escapeHtml(row.approvalId)}">Tolak</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>No./Jenis</th><th>Tanggal</th><th>Pengguna</th><th>Akun/Alur</th><th>Keterangan</th><th>Nominal</th><th>Aksi</th></tr></thead><tbody>${rows.map(row => `<tr><td><strong>${escapeHtml(row.referenceNo || row.transactionNo)}</strong><br><span class="muted">${escapeHtml(row.title || row.entityType)}</span></td><td>${escapeHtml(row.transactionDate)}</td><td>${escapeHtml(row.createdByName)}</td><td>${escapeHtml(row.accountName)}</td><td>${escapeHtml(row.description)}</td><td class="amount">${money(row.amount)}</td><td><div class="actions"><button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link</button>${row.receiptAvailable ? `<button class="btn btn-sm" data-approval-receipt="${escapeHtml(row.approvalId)}">Bukti</button>` : ''}${row.underlyingAvailable ? `<button class="btn btn-sm" data-approval-underlying="${escapeHtml(row.approvalId)}">Underlying</button>` : ''}${has('approvals.decide') ? `<button class="btn btn-success btn-sm" data-decision="APPROVED" data-approval-id="${escapeHtml(row.approvalId)}">Setujui</button><button class="btn btn-danger btn-sm" data-decision="REJECTED" data-approval-id="${escapeHtml(row.approvalId)}">Tolak</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 function bindApprovalReceiptButtons() { document.querySelectorAll('[data-approval-receipt]').forEach(button => button.addEventListener('click', () => window.open(`/api/approvals/${encodeURIComponent(button.dataset.approvalReceipt)}/receipt`, '_blank', 'noopener'))); }
+function bindApprovalUnderlyingButtons() { document.querySelectorAll('[data-approval-underlying]').forEach(button => button.addEventListener('click', () => window.open(`/api/approvals/${encodeURIComponent(button.dataset.approvalUnderlying)}/underlying`, '_blank', 'noopener'))); }
 
 function bindApprovalButtons() {
   document.querySelectorAll('[data-decision]').forEach(button => button.addEventListener('click', async () => {
@@ -657,21 +828,23 @@ async function renderAccounts() {
   const data = await api('/api/admin/accounts');
   document.getElementById('page').innerHTML = `
     <div class="page-head"><div><h2>Akun Kas</h2><p>Atur kategori transaksi dan batas auto-approve.</p></div></div>
-    <div class="section-grid"><div class="card"><h3>Tambah akun</h3><form id="account-form"><div class="grid-2"><div class="field"><label>Kode</label><input id="account-code" required></div><div class="field"><label>Nama akun</label><input id="account-name" required></div></div><div class="field"><label>Cakupan</label><select id="account-scope"><option value="KELUAR">Kas Keluar</option><option value="MASUK">Kas Masuk</option><option value="BOTH">Keduanya</option></select></div><div class="field"><label>Limit auto-approve</label><input id="account-limit" class="money-input" type="text" inputmode="numeric" value="0"></div><div class="field check"><input id="account-receipt" type="checkbox" checked><label for="account-receipt">Bukti wajib</label></div><button class="btn btn-primary" type="submit">Simpan akun</button></form></div>
+    <div class="section-grid"><div class="card"><h3>Tambah akun</h3><form id="account-form"><div class="grid-2"><div class="field"><label>Kode</label><input id="account-code" required></div><div class="field"><label>Nama akun</label><input id="account-name" required></div></div><div class="field"><label>Cakupan</label><select id="account-scope"><option value="KELUAR">Kas Keluar</option><option value="MASUK">Kas Masuk</option><option value="BOTH">Keduanya</option></select></div><div class="field"><label>Limit auto-approve</label><input id="account-limit" class="money-input" type="text" inputmode="numeric" value="0"></div><div class="field check"><input id="account-receipt" type="checkbox" checked><label for="account-receipt">Bukti transaksi wajib</label></div><div class="field check"><input id="account-underlying" type="checkbox"><label for="account-underlying">Underlying document wajib</label></div><button class="btn btn-primary" type="submit">Simpan akun</button></form></div>
     <div class="card"><h3>Daftar akun</h3>${accountTable(data.accounts)}</div></div>`;
   document.getElementById('account-form').addEventListener('submit', createAccount);
   document.querySelectorAll('[data-account-active]').forEach(button => button.addEventListener('click', () => updateAccount(button.dataset.accountActive, { active: button.dataset.nextActive === 'true' })));
+  document.querySelectorAll('[data-account-receipt]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountReceipt, { receiptRequired: input.checked })));
+  document.querySelectorAll('[data-account-underlying]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountUnderlying, { underlyingRequired: input.checked })));
 }
 
 function accountTable(accounts) {
   if (!accounts.length) return empty('Belum ada akun kas.');
-  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.transactionScope)}</td><td class="amount">${money(account.approvalLimit)}</td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Bukti wajib</th><th>Underlying wajib</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.transactionScope)}</td><td class="amount">${money(account.approvalLimit)}</td><td><input data-account-receipt="${escapeHtml(account.accountId)}" type="checkbox" ${account.receiptRequired ? 'checked' : ''}></td><td><input data-account-underlying="${escapeHtml(account.accountId)}" type="checkbox" ${account.underlyingRequired ? 'checked' : ''}></td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 async function createAccount(event) {
   event.preventDefault(); setLoading(true);
   try {
-    await api('/api/admin/accounts', { method: 'POST', body: { accountCode: value('account-code'), accountName: value('account-name'), transactionScope: value('account-scope'), approvalLimit: parseMoney(value('account-limit')), receiptRequired: document.getElementById('account-receipt').checked } });
+    await api('/api/admin/accounts', { method: 'POST', body: { accountCode: value('account-code'), accountName: value('account-name'), transactionScope: value('account-scope'), approvalLimit: parseMoney(value('account-limit')), receiptRequired: document.getElementById('account-receipt').checked, underlyingRequired: document.getElementById('account-underlying').checked } });
     toast('Akun kas berhasil dibuat.'); await bootstrap(); await renderAccounts();
   } catch (error) { toast(error.message, true); } finally { setLoading(false); }
 }
@@ -718,6 +891,19 @@ async function renderDatabaseMaintenance() {
   const data = await api('/api/admin/database/backups');
   document.getElementById('page').innerHTML = `
     <div class="page-head"><div><h2>Pemeliharaan Data</h2><p>Backup, riwayat arsip, dan reset data transaksi khusus Super User.</p></div><button id="create-backup" class="btn btn-ghost">Buat backup sekarang</button></div>
+    <div class="card"><h3>Export & Restore Data Lengkap</h3>
+      <div class="notice">Paket <strong>.kkbackup</strong> terenkripsi memuat database, pengguna dan password, konfigurasi keamanan, pengaturan, audit log, logo, bukti transaksi, serta underlying document. Simpan password backup secara terpisah.</div>
+      <div class="section-grid"><form id="full-backup-export-form"><h3>Export untuk Pemindahan Server</h3>
+        <div class="field"><label>Password Super User saat ini</label><input id="full-export-current-password" type="password" autocomplete="current-password" required></div>
+        <div class="field"><label>Password enkripsi backup (minimal 8 karakter)</label><input id="full-export-backup-password" type="password" autocomplete="new-password" minlength="8" required></div>
+        <button class="btn btn-primary" type="submit">Export Data Lengkap</button></form>
+      <form id="full-backup-restore-form"><h3>Restore di Server</h3>
+        <div class="field"><label>File .kkbackup</label><input id="full-restore-file" type="file" accept=".kkbackup,application/octet-stream" required></div>
+        <div class="grid-2"><div class="field"><label>Password Super User saat ini</label><input id="full-restore-current-password" type="password" autocomplete="current-password" required></div>
+        <div class="field"><label>Password backup</label><input id="full-restore-backup-password" type="password" required></div></div>
+        <div class="field"><label>Ketik PULIHKAN SELURUH DATA</label><input id="full-restore-confirmation" autocomplete="off" required></div>
+        <button class="btn btn-danger" type="submit">Backup Kondisi Saat Ini & Restore</button></form></div>
+    </div>
     <div class="card danger-zone"><h3>Reset Data Transaksi</h3>
       <div class="notice warn"><strong>Perhatian:</strong> transaksi, mutasi, transfer, UMO, koreksi, approval, nomor urut, dan audit log akan dikosongkan. Pengguna, akun, hak akses, logo, pengaturan, serta file bukti tetap dipertahankan. Database lama otomatis diarsipkan sebelum reset.</div>
       <form id="database-clear-form">
@@ -728,8 +914,40 @@ async function renderDatabaseMaintenance() {
     </div>
     <div class="card"><div class="page-head"><div><h3>Riwayat Backup Database</h3><p>Backup sebelum reset dipertahankan sebagai historical database.</p></div></div>${backupTable(data.backups || [])}</div>`;
   document.getElementById('create-backup').addEventListener('click', createManualBackup);
+  document.getElementById('full-backup-export-form').addEventListener('submit', exportFullBackup);
+  document.getElementById('full-backup-restore-form').addEventListener('submit', restoreFullBackup);
   document.getElementById('database-clear-form').addEventListener('submit', clearDatabase);
   bindBackupDownloads();
+}
+
+async function exportFullBackup(event) {
+  event.preventDefault(); setLoading(true);
+  try {
+    const result = await apiBlob('/api/admin/full-backup/export', { method: 'POST', body: {
+      currentPassword: value('full-export-current-password'), backupPassword: value('full-export-backup-password')
+    } });
+    const match = result.disposition.match(/filename="?([^";]+)"?/i);
+    downloadBlob(result.blob, match ? match[1] : 'Kas_Kecil_Lengkap.kkbackup');
+    toast('Export data lengkap berhasil dibuat.');
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+async function restoreFullBackup(event) {
+  event.preventDefault();
+  const confirmation = value('full-restore-confirmation');
+  if (confirmation.toUpperCase() !== 'PULIHKAN SELURUH DATA') return toast('Teks konfirmasi restore belum sesuai.', true);
+  if (!confirm('Seluruh data server ini akan diganti oleh isi backup. Backup kondisi saat ini akan dibuat terlebih dahulu. Lanjutkan?')) return;
+  const form = new FormData();
+  form.set('backupFile', document.getElementById('full-restore-file').files[0]);
+  form.set('currentPassword', value('full-restore-current-password'));
+  form.set('backupPassword', value('full-restore-backup-password'));
+  form.set('confirmation', confirmation);
+  setLoading(true);
+  try {
+    await api('/api/admin/full-backup/restore', { method: 'POST', body: form });
+    toast('Restore berhasil. Aplikasi sedang restart; silakan login kembali beberapa saat lagi.');
+    setTimeout(() => location.reload(), 4000);
+  } catch (error) { toast(error.message, true); setLoading(false); }
 }
 
 function backupTable(backups) {
@@ -812,11 +1030,12 @@ function transactionTable(rows, withReceipt) {
   if (!rows.length) return empty('Belum ada transaksi.');
   const canReceipt = has('receipts.view_all') || has('receipts.view_self');
   const hasActions = withReceipt && (canReceipt || rows.some(row => row.approvalId));
-  return `<div class="table-wrap"><table><thead><tr><th>No.</th><th>Tanggal</th><th>Pengguna</th><th>Jenis</th><th>Akun</th><th>Keterangan</th><th>Status</th><th>Nominal</th>${hasActions ? '<th>Aksi</th>' : ''}</tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(row.transactionNo)}</td><td>${escapeHtml(row.transactionDate)}</td><td>${escapeHtml(row.createdByName)}</td><td>${escapeHtml(typeLabel(row.type))}</td><td>${escapeHtml(row.accountName)}</td><td>${escapeHtml(row.description)}</td><td>${statusHtml(row.status)}</td><td class="amount">${money(row.amount)}</td>${hasActions ? `<td><div class="actions">${canReceipt && row.receiptAvailable ? `<button class="btn btn-sm" data-receipt="${escapeHtml(row.transactionId)}">Bukti</button>` : ''}${row.approvalId ? `<button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link approval</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>No.</th><th>Tanggal</th><th>Pengguna</th><th>Jenis</th><th>Akun</th><th>Keterangan</th><th>Status</th><th>Nominal</th>${hasActions ? '<th>Aksi</th>' : ''}</tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(row.transactionNo)}</td><td>${escapeHtml(row.transactionDate)}</td><td>${escapeHtml(row.createdByName)}</td><td>${escapeHtml(typeLabel(row.type))}</td><td>${escapeHtml(row.accountName)}</td><td>${escapeHtml(row.description)}</td><td>${statusHtml(row.status)}</td><td class="amount">${money(row.amount)}</td>${hasActions ? `<td><div class="actions">${canReceipt && row.receiptAvailable ? `<button class="btn btn-sm" data-receipt="${escapeHtml(row.transactionId)}">Bukti</button>` : ''}${canReceipt && row.underlyingAvailable ? `<button class="btn btn-sm" data-underlying="${escapeHtml(row.transactionId)}">Underlying</button>` : ''}${row.approvalId ? `<button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link approval</button>` : ''}</div></td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function bindReceiptButtons() {
   document.querySelectorAll('[data-receipt]').forEach(button => button.addEventListener('click', () => window.open(`/api/receipts/${encodeURIComponent(button.dataset.receipt)}`, '_blank', 'noopener')));
+  document.querySelectorAll('[data-underlying]').forEach(button => button.addEventListener('click', () => window.open(`/api/underlying-documents/${encodeURIComponent(button.dataset.underlying)}`, '_blank', 'noopener')));
 }
 
 async function loadPublicConfig() {
@@ -944,6 +1163,7 @@ function sourceLabel(type) { return ({ TRANSACTION: 'Transaksi', TRANSFER: 'Tran
 function money(number) { return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(Number(number || 0)); }
 function formatBytes(number) { const bytes = Number(number || 0); if (bytes < 1024) return `${bytes} B`; if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`; return `${(bytes / (1024 * 1024)).toFixed(1)} MB`; }
 function todayInput() { const d = new Date(); return [d.getFullYear(), String(d.getMonth() + 1).padStart(2, '0'), String(d.getDate()).padStart(2, '0')].join('-'); }
+function monthLabel(value) { if (!/^\d{4}-\d{2}$/.test(String(value || ''))) return String(value || '-'); const [year, month] = String(value).split('-').map(Number); return new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(Date.UTC(year, month - 1, 1))); }
 function datePlusDays(days) { const date = new Date(); date.setDate(date.getDate() + Number(days || 0)); return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-'); }
 function formatDateTime(value) { return value ? new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : ''; }
 function value(id) { return document.getElementById(id).value.trim(); }

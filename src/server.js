@@ -1,6 +1,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
+const { DatabaseSync } = require('node:sqlite');
 const express = require('express');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
@@ -12,6 +14,8 @@ const cron = require('node-cron');
 
 const {
   db,
+  DB_PATH,
+  DATA_DIR,
   BACKUP_DIR,
   PERMISSION_CATALOG,
   nowIso,
@@ -22,7 +26,9 @@ const {
   audit,
   cleanupExpiredSessions,
   backupDatabase,
-  listDatabaseBackups
+  listDatabaseBackups,
+  ensureAccountingPeriod,
+  localPeriodMonth
 } = require('./db');
 const { ROLE_DEFAULTS } = require('./permissions');
 const {
@@ -37,12 +43,15 @@ const {
   verifyApprovalPin,
   approvalPinFingerprint,
   assertApprovalPin,
+  appPepperForBackup,
+  installRestoredAppPepper,
+  RESTORED_PEPPER_PATH,
   newId,
   cleanText
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.5.0';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
 const DEFAULT_COMPANY_NAME = process.env.DEFAULT_COMPANY_NAME || 'Nama Perusahaan';
@@ -85,8 +94,42 @@ function localToday() {
   }).format(new Date());
 }
 
+function monthBounds(periodMonth) {
+  if (!/^\d{4}-\d{2}$/.test(String(periodMonth || ''))) throw new AppError('Periode bulan tidak valid.');
+  const [year, month] = String(periodMonth).split('-').map(Number);
+  if (month < 1 || month > 12) throw new AppError('Periode bulan tidak valid.');
+  const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return { startDate: `${periodMonth}-01`, endDate: `${periodMonth}-${String(lastDay).padStart(2, '0')}` };
+}
+
+function nextPeriodMonth(periodMonth) {
+  const [year, month] = String(periodMonth).split('-').map(Number);
+  const date = new Date(Date.UTC(year, month, 1));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function getOpenPeriod() {
+  return db.prepare("SELECT * FROM accounting_periods WHERE status='OPEN' ORDER BY period_month DESC LIMIT 1").get() || ensureAccountingPeriod();
+}
+
+function assertOpenTransactionDate(value, label = 'Tanggal transaksi') {
+  const date = validatedDate(value, label);
+  if (date > localToday()) throw new AppError(`${label} tidak boleh melebihi hari ini.`);
+  const open = getOpenPeriod();
+  const bounds = monthBounds(open.period_month);
+  if (date < bounds.startDate || date > bounds.endDate) {
+    throw new AppError(`${label} wajib berada pada periode terbuka ${open.period_month}. Selesaikan End of Month bila akan berpindah bulan.`);
+  }
+  return date;
+}
+
 function safeFileName(value) {
   return String(value || 'bukti').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+}
+
+function requestFile(req, field) {
+  if (req.file && req.file.fieldname === field) return req.file;
+  return Array.isArray(req.files?.[field]) ? req.files[field][0] : null;
 }
 
 const upload = multer({
@@ -216,6 +259,7 @@ function accountPublic(row) {
     transactionScope: row.transaction_scope,
     approvalLimit: Number(row.approval_limit),
     receiptRequired: Boolean(row.receipt_required),
+    underlyingRequired: Boolean(row.underlying_required),
     active: Boolean(row.active)
   };
 }
@@ -234,6 +278,8 @@ function transactionPublic(row) {
     status: row.status,
     receiptAvailable: Boolean(row.receipt_path),
     receiptMime: row.receipt_mime || '',
+    underlyingAvailable: Boolean(row.underlying_path),
+    underlyingMime: row.underlying_mime || '',
     createdBy: row.created_by,
     createdByName: row.created_by_name,
     approvedByName: row.approved_by_name || '',
@@ -404,12 +450,20 @@ function queryLedger(req, query = {}, limit = 500, exportMode = false) {
   return db.prepare(sql).all(...params).map(transactionPublic);
 }
 
-function dashboardData(req, requestedUserId) {
+function dashboardData(req, requestedUserId, requestedStartDate = '', requestedEndDate = '') {
   if (!hasPermission(req, 'dashboard.view')) throw new AppError('Anda tidak memiliki akses dashboard.', 403);
   const canViewAll = hasPermission(req, 'dashboard.view_all_users');
   const scopeUserId = canViewAll && requestedUserId && requestedUserId !== 'ALL' ? String(requestedUserId) : (canViewAll ? null : req.auth.user.id);
-  const filter = scopeUserId ? ' AND t.created_by = ?' : '';
-  const params = scopeUserId ? [scopeUserId] : [];
+  const today = localToday();
+  const defaultStart = `${today.slice(0, 7)}-01`;
+  const startDate = validatedDate(requestedStartDate || defaultStart, 'Tanggal awal');
+  const endDate = validatedDate(requestedEndDate || today, 'Tanggal akhir');
+  if (startDate > endDate) throw new AppError('Tanggal awal tidak boleh melebihi tanggal akhir.');
+  if (endDate > today) throw new AppError('Tanggal akhir tidak boleh melebihi hari ini.');
+  const filters = ['t.transaction_date>=?', 't.transaction_date<=?'];
+  const params = [startDate, endDate];
+  if (scopeUserId) { filters.push('t.created_by=?'); params.push(scopeUserId); }
+  const filter = ` AND ${filters.join(' AND ')}`;
   const summary = db.prepare(`
     SELECT
       COALESCE(SUM(CASE WHEN t.status='APPROVED' AND t.type='MASUK' THEN t.amount ELSE 0 END),0) AS total_in,
@@ -440,13 +494,13 @@ function dashboardData(req, requestedUserId) {
         COALESCE(SUM(CASE WHEN t.status='APPROVED' AND t.type='KELUAR' THEN t.amount ELSE 0 END),0) AS totalOut,
         SUM(CASE WHEN t.status='PENDING' THEN 1 ELSE 0 END) AS pendingCount,
         SUM(CASE WHEN t.status='REJECTED' THEN 1 ELSE 0 END) AS rejectedCount
-      FROM users u LEFT JOIN transactions t ON t.created_by=u.id
-      WHERE u.active=1
+      FROM users u LEFT JOIN transactions t ON t.created_by=u.id AND t.transaction_date>=? AND t.transaction_date<=?
+      WHERE u.active=1 ${scopeUserId ? 'AND u.id=?' : ''}
       GROUP BY u.id ORDER BY u.name
-    `).all();
+    `).all(startDate, endDate, ...(scopeUserId ? [scopeUserId] : []));
     const balances = db.prepare(`SELECT user_id,
       COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS balance
-      FROM ledger_entries GROUP BY user_id`).all();
+      FROM ledger_entries WHERE entry_date<=? ${scopeUserId ? 'AND user_id=?' : ''} GROUP BY user_id`).all(endDate, ...(scopeUserId ? [scopeUserId] : []));
     const balanceMap = Object.fromEntries(balances.map(row => [row.user_id, Number(row.balance)]));
     const outstanding = db.prepare(`SELECT user_id,COALESCE(SUM(advance_amount),0) AS total
       FROM operational_advances WHERE status IN ('OPEN','SETTLEMENT_PENDING') GROUP BY user_id`).all();
@@ -455,9 +509,9 @@ function dashboardData(req, requestedUserId) {
   }
 
 
-  const balanceFilter = scopeUserId ? 'WHERE user_id=?' : '';
-  const balanceRow = db.prepare(`SELECT COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS balance FROM ledger_entries ${balanceFilter}`)
-    .get(...(scopeUserId ? [scopeUserId] : []));
+  const balanceRow = db.prepare(`SELECT COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS balance
+    FROM ledger_entries WHERE entry_date<=? ${scopeUserId ? 'AND user_id=?' : ''}`)
+    .get(endDate, ...(scopeUserId ? [scopeUserId] : []));
   const umoFilter = scopeUserId ? 'AND user_id=?' : '';
   const umoRow = db.prepare(`SELECT COALESCE(SUM(advance_amount),0) AS total FROM operational_advances
     WHERE status IN ('OPEN','SETTLEMENT_PENDING') ${umoFilter}`).get(...(scopeUserId ? [scopeUserId] : []));
@@ -465,6 +519,8 @@ function dashboardData(req, requestedUserId) {
   return {
     scope: scopeUserId || 'ALL',
     canViewAll,
+    startDate,
+    endDate,
     userOptions,
     openingBalance: opening,
     totalIn: Number(summary.total_in),
@@ -550,6 +606,7 @@ app.post('/api/auth/change-password', authMiddleware, (req, res, next) => {
 
 app.get('/api/bootstrap', authMiddleware, (req, res) => {
   const accounts = db.prepare('SELECT * FROM accounts WHERE active=1 ORDER BY code').all().map(accountPublic);
+  const openPeriod = getOpenPeriod();
   const approvalCount = hasPermission(req, 'approvals.view')
     ? db.prepare("SELECT COUNT(*) AS total FROM approval_requests WHERE decision='PENDING' AND expires_at>=?").get(nowIso()).total
     : 0;
@@ -561,9 +618,12 @@ app.get('/api/bootstrap', authMiddleware, (req, res) => {
       maxUploadMb: Number(getSetting('MAX_UPLOAD_MB', 5)),
       umoApprovalLimit: Number(getSetting('UMO_APPROVAL_LIMIT', 500000)),
       umoDueDays: Number(getSetting('UMO_DUE_DAYS', 3)),
-      timezone: APP_TIMEZONE()
+    timezone: APP_TIMEZONE(),
+    appVersion: APP_VERSION
     },
     accounts,
+    openPeriod: { periodMonth: openPeriod.period_month, status: openPeriod.status },
+    budget: hasPermission(req, 'budgets.view') ? budgetData(openPeriod.period_month) : null,
     cashBalance: userBalance(req.auth.user.id),
     approvalCount
   });
@@ -579,7 +639,7 @@ app.get('/api/users/options', authMiddleware, (req, res, next) => {
 // ---------- Dashboard, ledger, transactions ----------
 
 app.get('/api/dashboard', authMiddleware, requirePermission('dashboard.view'), (req, res) => {
-  res.json(dashboardData(req, req.query.userId));
+  res.json(dashboardData(req, req.query.userId, req.query.startDate, req.query.endDate));
 });
 
 app.get('/api/ledger', authMiddleware, (req, res, next) => {
@@ -589,12 +649,14 @@ app.get('/api/ledger', authMiddleware, (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/transactions', authMiddleware, requirePermission('transactions.create'), upload.single('receipt'), (req, res, next) => {
+app.post('/api/transactions', authMiddleware, requirePermission('transactions.create'), upload.fields([
+  { name: 'receipt', maxCount: 1 },
+  { name: 'underlyingDocument', maxCount: 1 }
+]), (req, res, next) => {
   try {
     const type = String(req.body.type || '').toUpperCase();
     if (!['MASUK', 'KELUAR'].includes(type)) throw new AppError('Jenis transaksi tidak valid.');
-    const transactionDate = String(req.body.transactionDate || '');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(transactionDate) || transactionDate > localToday()) throw new AppError('Tanggal transaksi tidak valid atau melebihi hari ini.');
+    const transactionDate = assertOpenTransactionDate(req.body.transactionDate, 'Tanggal transaksi');
     const amount = toAmount(req.body.amount);
     if (amount <= 0) throw new AppError('Nominal transaksi harus lebih dari nol.');
     const account = db.prepare('SELECT * FROM accounts WHERE id=? AND active=1').get(String(req.body.accountId || ''));
@@ -602,9 +664,13 @@ app.post('/api/transactions', authMiddleware, requirePermission('transactions.cr
     if (account.transaction_scope !== 'BOTH' && account.transaction_scope !== type) throw new AppError('Akun tidak sesuai dengan jenis transaksi.');
     const description = cleanText(req.body.description, 500);
     if (!description) throw new AppError('Keterangan transaksi wajib diisi.');
-    if (type === 'KELUAR' && !req.file) throw new AppError('Bukti transaksi wajib untuk kas keluar.');
-    if (req.file && req.file.size > Number(getSetting('MAX_UPLOAD_MB', 5)) * 1024 * 1024) {
-      throw new AppError(`Ukuran bukti melebihi batas ${getSetting('MAX_UPLOAD_MB', 5)} MB.`);
+    const receiptFile = requestFile(req, 'receipt');
+    const underlyingFile = requestFile(req, 'underlyingDocument');
+    if (type === 'KELUAR' && account.receipt_required && !receiptFile) throw new AppError('Bukti transaksi wajib untuk akun ini.');
+    if (type === 'KELUAR' && account.underlying_required && !underlyingFile) throw new AppError('Underlying document wajib untuk akun ini.');
+    const maxUploadBytes = Number(getSetting('MAX_UPLOAD_MB', 5)) * 1024 * 1024;
+    if ([receiptFile, underlyingFile].some(file => file && file.size > maxUploadBytes)) {
+      throw new AppError(`Ukuran lampiran melebihi batas ${getSetting('MAX_UPLOAD_MB', 5)} MB per file.`);
     }
 
     const status = type === 'MASUK' || amount <= Number(account.approval_limit) ? 'APPROVED' : 'PENDING';
@@ -617,12 +683,16 @@ app.post('/api/transactions', authMiddleware, requirePermission('transactions.cr
     const saveTransaction = db.transaction(() => {
       const transactionNo = nextDocumentNo('KSK', req.auth.user.id);
       db.prepare(`
-        INSERT INTO transactions(id,transaction_no,transaction_date,type,account_id,amount,approval_limit_snapshot,description,counterparty,receipt_path,receipt_original_name,receipt_mime,status,created_by,created_at,approved_by,approved_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO transactions(id,transaction_no,transaction_date,type,account_id,amount,approval_limit_snapshot,description,counterparty,
+          receipt_path,receipt_original_name,receipt_mime,underlying_path,underlying_original_name,underlying_mime,
+          status,created_by,created_at,approved_by,approved_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(
         transactionId, transactionNo, transactionDate, type, account.id, amount, Number(account.approval_limit), description,
-        cleanText(req.body.counterparty, 150), req.file ? req.file.filename : '', req.file ? safeFileName(req.file.originalname) : '',
-        req.file ? req.file.mimetype : '', status, req.auth.user.id, now, status === 'APPROVED' ? req.auth.user.id : null,
+        cleanText(req.body.counterparty, 150), receiptFile ? receiptFile.filename : '', receiptFile ? safeFileName(receiptFile.originalname) : '',
+        receiptFile ? receiptFile.mimetype : '', underlyingFile ? underlyingFile.filename : '',
+        underlyingFile ? safeFileName(underlyingFile.originalname) : '', underlyingFile ? underlyingFile.mimetype : '',
+        status, req.auth.user.id, now, status === 'APPROVED' ? req.auth.user.id : null,
         status === 'APPROVED' ? now : null
       );
       if (status === 'PENDING') {
@@ -655,6 +725,17 @@ app.get('/api/receipts/:transactionId', authMiddleware, (req, res, next) => {
     res.type(row.receipt_mime || 'application/octet-stream');
     res.setHeader('Content-Disposition', `inline; filename="${safeFileName(row.receipt_original_name)}"`);
     res.sendFile(fullPath);
+  } catch (error) { next(error); }
+});
+
+app.get('/api/underlying-documents/:transactionId', authMiddleware, (req, res, next) => {
+  try {
+    const row = db.prepare(`SELECT id,created_by,underlying_path,underlying_original_name,underlying_mime
+      FROM transactions WHERE id=?`).get(req.params.transactionId);
+    if (!row || !row.underlying_path) throw new AppError('Underlying document tidak ditemukan.', 404);
+    const canView = hasPermission(req, 'receipts.view_all') || (hasPermission(req, 'receipts.view_self') && row.created_by === req.auth.user.id);
+    if (!canView) throw new AppError('Anda tidak memiliki akses ke dokumen ini.', 403);
+    sendStoredReceipt(res, { path: row.underlying_path, name: row.underlying_original_name, mime: row.underlying_mime });
   } catch (error) { next(error); }
 });
 
@@ -731,6 +812,12 @@ function approvalReceipt(approval) {
       FROM operational_advances WHERE id=?`).get(approval.entity_id);
   }
   return null;
+}
+
+function approvalUnderlying(approval) {
+  if (approval.entity_type !== 'TRANSACTION') return null;
+  return db.prepare(`SELECT underlying_path AS path,underlying_original_name AS name,underlying_mime AS mime
+    FROM transactions WHERE id=?`).get(approval.entity_id);
 }
 
 function sendStoredReceipt(res, descriptor) {
@@ -860,6 +947,14 @@ app.get('/api/approvals/:approvalId/receipt', authMiddleware, requirePermission(
   } catch (error) { next(error); }
 });
 
+app.get('/api/approvals/:approvalId/underlying', authMiddleware, requirePermission('approvals.view'), (req, res, next) => {
+  try {
+    const approval = db.prepare('SELECT * FROM approval_requests WHERE id=?').get(req.params.approvalId);
+    if (!approval) throw new AppError('Approval tidak ditemukan.', 404);
+    sendStoredReceipt(res, approvalUnderlying(approval));
+  } catch (error) { next(error); }
+});
+
 app.post('/api/approvals/:approvalId/decision', authMiddleware, requirePermission('approvals.decide'), (req, res, next) => {
   try {
     const { decision, note } = validateDecision(req.body);
@@ -875,7 +970,11 @@ app.get('/api/public/approvals/:token', (req, res, next) => {
     const detail = approvalEntityDetail(approval);
     if (!detail) throw new AppError('Data approval tidak ditemukan.', 404);
     res.setHeader('Cache-Control', 'no-store');
-    res.json({ ...detail, receiptUrl: detail.receiptAvailable ? `/api/public/approvals/${encodeURIComponent(req.params.token)}/receipt` : '' });
+    res.json({
+      ...detail,
+      receiptUrl: detail.receiptAvailable ? `/api/public/approvals/${encodeURIComponent(req.params.token)}/receipt` : '',
+      underlyingUrl: detail.underlyingAvailable ? `/api/public/approvals/${encodeURIComponent(req.params.token)}/underlying` : ''
+    });
   } catch (error) { next(error); }
 });
 
@@ -884,6 +983,14 @@ app.get('/api/public/approvals/:token/receipt', (req, res, next) => {
     const approval = db.prepare('SELECT * FROM approval_requests WHERE token_hash=?').get(hashToken('APPROVAL', req.params.token));
     if (!approval) throw new AppError('Tautan approval tidak valid.', 404);
     sendStoredReceipt(res, approvalReceipt(approval));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/public/approvals/:token/underlying', (req, res, next) => {
+  try {
+    const approval = db.prepare('SELECT * FROM approval_requests WHERE token_hash=?').get(hashToken('APPROVAL', req.params.token));
+    if (!approval) throw new AppError('Tautan approval tidak valid.', 404);
+    sendStoredReceipt(res, approvalUnderlying(approval));
   } catch (error) { next(error); }
 });
 
@@ -1011,6 +1118,239 @@ app.get('/api/account-summary', authMiddleware, requirePermission('account_summa
   try { res.json(queryAccountSummary(req.query)); } catch (error) { next(error); }
 });
 
+function previousPeriodMonth(periodMonth) {
+  const [year, month] = String(periodMonth).split('-').map(Number);
+  const date = new Date(Date.UTC(year, month - 2, 1));
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function queryAccountComparison(req, query = {}) {
+  const currentMonth = localPeriodMonth();
+  const month1 = String(query.month1 || previousPeriodMonth(currentMonth));
+  const month2 = String(query.month2 || currentMonth);
+  monthBounds(month1); monthBounds(month2);
+  const canViewAll = hasPermission(req, 'account_comparison.view_all_users');
+  const requestedUser = String(query.userId || '').trim();
+  const userId = canViewAll ? (requestedUser && requestedUser !== 'ALL' ? requestedUser : '') : req.auth.user.id;
+  if (userId && !db.prepare('SELECT 1 FROM users WHERE id=?').get(userId)) throw new AppError('Pengguna tidak ditemukan.', 404);
+  const join = ["t.account_id=a.id", "t.status='APPROVED'", "substr(t.transaction_date,1,7) IN (?,?)"];
+  const params = [month1, month2];
+  if (userId) { join.push('t.created_by=?'); params.push(userId); }
+  const rows = db.prepare(`
+    SELECT a.id AS account_id,a.code AS account_code,a.name AS account_name,
+      COALESCE(SUM(CASE WHEN substr(t.transaction_date,1,7)=? THEN t.amount ELSE 0 END),0) AS month_1,
+      COALESCE(SUM(CASE WHEN substr(t.transaction_date,1,7)=? THEN t.amount ELSE 0 END),0) AS month_2
+    FROM accounts a LEFT JOIN transactions t ON ${join.join(' AND ')}
+    GROUP BY a.id,a.code,a.name ORDER BY a.code
+  `).all(month1, month2, ...params).map(row => ({
+    accountId: row.account_id,
+    accountCode: row.account_code,
+    accountName: row.account_name,
+    month1Amount: Number(row.month_1),
+    month2Amount: Number(row.month_2),
+    difference: Number(row.month_2) - Number(row.month_1)
+  }));
+  const users = canViewAll ? db.prepare('SELECT id AS userId,name,username,role FROM users WHERE active=1 ORDER BY name').all() : [];
+  return { month1, month2, canViewAll, userId: userId || 'ALL', users, rows };
+}
+
+app.get('/api/account-comparison', authMiddleware, requirePermission('account_comparison.view'), (req, res, next) => {
+  try { res.json(queryAccountComparison(req, req.query)); } catch (error) { next(error); }
+});
+
+// ---------- Pagu kas dan periode bulanan ----------
+
+function budgetData(periodMonth) {
+  monthBounds(periodMonth);
+  const period = db.prepare('SELECT * FROM accounting_periods WHERE period_month=?').get(periodMonth);
+  const budget = db.prepare('SELECT * FROM cash_budgets WHERE period_month=?').get(periodMonth);
+  const bounds = monthBounds(periodMonth);
+  const allocationRows = budget
+    ? db.prepare(`SELECT ba.*,a.code AS account_code,a.name AS account_name,a.active
+        FROM cash_budget_allocations ba JOIN accounts a ON a.id=ba.account_id
+        WHERE ba.budget_id=? ORDER BY a.code`).all(budget.id)
+    : db.prepare("SELECT id AS account_id,code AS account_code,name AS account_name,active,0 AS percentage_bps,0 AS allocated_amount FROM accounts WHERE active=1 AND transaction_scope='KELUAR' ORDER BY code").all();
+  const usage = db.prepare(`SELECT account_id,
+      COALESCE(SUM(CASE WHEN status='APPROVED' THEN amount ELSE 0 END),0) AS used_amount,
+      COALESCE(SUM(CASE WHEN status='PENDING' THEN amount ELSE 0 END),0) AS pending_amount
+    FROM transactions WHERE type='KELUAR' AND transaction_date>=? AND transaction_date<=?
+    GROUP BY account_id`).all(bounds.startDate, bounds.endDate);
+  const usageMap = Object.fromEntries(usage.map(row => [row.account_id, row]));
+  const allocations = allocationRows.map(row => {
+    const item = usageMap[row.account_id] || {};
+    const allocated = Number(row.allocated_amount || 0);
+    const used = Number(item.used_amount || 0);
+    const pending = Number(item.pending_amount || 0);
+    return {
+      accountId: row.account_id,
+      accountCode: row.account_code,
+      accountName: row.account_name,
+      active: Boolean(row.active),
+      percentageBps: Number(row.percentage_bps || 0),
+      percentage: Number(row.percentage_bps || 0) / 100,
+      allocatedAmount: allocated,
+      usedAmount: used,
+      pendingAmount: pending,
+      remainingAmount: allocated - used
+    };
+  });
+  const totals = allocations.reduce((sum, row) => ({
+    allocatedAmount: sum.allocatedAmount + row.allocatedAmount,
+    usedAmount: sum.usedAmount + row.usedAmount,
+    pendingAmount: sum.pendingAmount + row.pendingAmount,
+    remainingAmount: sum.remainingAmount + row.remainingAmount
+  }), { allocatedAmount: 0, usedAmount: 0, pendingAmount: 0, remainingAmount: 0 });
+  return {
+    periodMonth,
+    periodStatus: period?.status || '',
+    totalBudget: Number(budget?.total_budget || 0),
+    configured: Boolean(budget),
+    allocations,
+    totals
+  };
+}
+
+app.get('/api/budgets/current', authMiddleware, requirePermission('budgets.view'), (req, res, next) => {
+  try {
+    const open = getOpenPeriod();
+    const requested = String(req.query.periodMonth || open.period_month);
+    const periods = db.prepare(`SELECT p.*,
+      (SELECT COUNT(*) FROM cash_budgets b WHERE b.period_month=p.period_month) AS has_budget
+      FROM accounting_periods p ORDER BY p.period_month DESC LIMIT 24`).all().map(row => ({
+      periodMonth: row.period_month, status: row.status, openedAt: row.opened_at,
+      closedAt: row.closed_at || '', hasBudget: Boolean(row.has_budget)
+    }));
+    res.json({
+      ...budgetData(requested),
+      openPeriodMonth: open.period_month,
+      currentCalendarMonth: localPeriodMonth(),
+      canManage: hasPermission(req, 'budgets.manage'),
+      canClose: hasPermission(req, 'periods.close'),
+      canReopen: hasPermission(req, 'periods.reopen'),
+      periods
+    });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/budgets/:periodMonth', authMiddleware, requirePermission('budgets.manage'), (req, res, next) => {
+  try {
+    const periodMonth = String(req.params.periodMonth);
+    const open = getOpenPeriod();
+    if (periodMonth !== open.period_month) throw new AppError('Pagu hanya dapat diubah pada periode yang sedang terbuka.');
+    const totalBudget = toAmount(req.body.totalBudget);
+    if (totalBudget <= 0) throw new AppError('Total pagu kas harus lebih dari nol.');
+    const input = Array.isArray(req.body.allocations) ? req.body.allocations : [];
+    if (!input.length) throw new AppError('Pembagian pagu per akun wajib diisi.');
+    const seen = new Set();
+    const normalized = input.map(item => {
+      const accountId = String(item.accountId || '');
+      if (seen.has(accountId)) throw new AppError('Akun pada pembagian pagu tidak boleh duplikat.');
+      seen.add(accountId);
+      const account = db.prepare("SELECT * FROM accounts WHERE id=? AND active=1 AND transaction_scope='KELUAR'").get(accountId);
+      const percentageBps = Number(item.percentageBps);
+      if (!account || !Number.isInteger(percentageBps) || percentageBps < 0 || percentageBps > 10000) {
+        throw new AppError('Akun atau persentase pembagian pagu tidak valid.');
+      }
+      return { account, percentageBps, allocatedAmount: Math.floor(totalBudget * percentageBps / 10000) };
+    });
+    if (normalized.reduce((sum, item) => sum + item.percentageBps, 0) !== 10000) throw new AppError('Total persentase pembagian pagu wajib tepat 100%.');
+    const roundingDifference = totalBudget - normalized.reduce((sum, item) => sum + item.allocatedAmount, 0);
+    normalized[normalized.length - 1].allocatedAmount += roundingDifference;
+    const save = db.transaction(() => {
+      let budget = db.prepare('SELECT * FROM cash_budgets WHERE period_month=?').get(periodMonth);
+      const now = nowIso();
+      if (!budget) {
+        const id = newId('BDG');
+        db.prepare(`INSERT INTO cash_budgets(id,period_month,total_budget,created_by,created_at,updated_by,updated_at)
+          VALUES(?,?,?,?,?,?,?)`).run(id, periodMonth, totalBudget, req.auth.user.id, now, req.auth.user.id, now);
+        budget = db.prepare('SELECT * FROM cash_budgets WHERE id=?').get(id);
+      } else {
+        db.prepare('UPDATE cash_budgets SET total_budget=?,updated_by=?,updated_at=? WHERE id=?')
+          .run(totalBudget, req.auth.user.id, now, budget.id);
+        db.prepare('DELETE FROM cash_budget_allocations WHERE budget_id=?').run(budget.id);
+      }
+      const insert = db.prepare(`INSERT INTO cash_budget_allocations(budget_id,account_id,percentage_bps,allocated_amount)
+        VALUES(?,?,?,?)`);
+      normalized.forEach(item => insert.run(budget.id, item.account.id, item.percentageBps, item.allocatedAmount));
+      audit(req.auth.user.id, 'UPSERT', 'CASH_BUDGET', budget.id, '', { periodMonth, totalBudget, allocations: normalized.length }, 'Pagu kas bulanan disimpan');
+    });
+    save();
+    res.json({ ok: true, ...budgetData(periodMonth) });
+  } catch (error) { next(error); }
+});
+
+function pendingPeriodItems(bounds) {
+  return {
+    transactions: Number(db.prepare("SELECT COUNT(*) AS total FROM transactions WHERE status='PENDING' AND transaction_date BETWEEN ? AND ?").get(bounds.startDate, bounds.endDate).total),
+    transfers: Number(db.prepare("SELECT COUNT(*) AS total FROM cash_transfers WHERE status='PENDING' AND transfer_date BETWEEN ? AND ?").get(bounds.startDate, bounds.endDate).total),
+    umo: Number(db.prepare("SELECT COUNT(*) AS total FROM operational_advances WHERE status IN ('PENDING','SETTLEMENT_PENDING')").get().total),
+    corrections: Number(db.prepare("SELECT COUNT(*) AS total FROM transaction_corrections WHERE status='PENDING'").get().total)
+  };
+}
+
+app.post('/api/periods/eom', authMiddleware, requirePermission('periods.close'), (req, res, next) => {
+  try {
+    const open = getOpenPeriod();
+    if (open.period_month >= localPeriodMonth()) throw new AppError('End of Month baru dapat dilakukan setelah bulan periode berakhir.');
+    const bounds = monthBounds(open.period_month);
+    const pending = pendingPeriodItems(bounds);
+    if (Object.values(pending).some(Boolean)) throw new AppError(`EOM belum dapat dilakukan. Masih ada data pending: transaksi ${pending.transactions}, transfer ${pending.transfers}, UMO ${pending.umo}, koreksi ${pending.corrections}.`);
+    const nextMonth = nextPeriodMonth(open.period_month);
+    const close = db.transaction(() => {
+      const users = db.prepare('SELECT id FROM users WHERE active=1').all();
+      const closing = db.prepare(`SELECT COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS total
+        FROM ledger_entries WHERE user_id=? AND entry_date<=?`);
+      const upsertBalance = db.prepare(`INSERT INTO period_balances(period_id,user_id,opening_balance,closing_balance)
+        VALUES(?,?,0,?) ON CONFLICT(period_id,user_id) DO UPDATE SET closing_balance=excluded.closing_balance`);
+      users.forEach(user => upsertBalance.run(open.id, user.id, Number(closing.get(user.id, bounds.endDate).total || 0)));
+      db.prepare("UPDATE accounting_periods SET status='CLOSED',closed_at=?,closed_by=?,close_note=? WHERE id=?")
+        .run(nowIso(), req.auth.user.id, cleanText(req.body.note, 500), open.id);
+      let next = db.prepare('SELECT * FROM accounting_periods WHERE period_month=?').get(nextMonth);
+      if (!next) {
+        const nextId = newId('PER');
+        db.prepare("INSERT INTO accounting_periods(id,period_month,status,opened_at,opened_by) VALUES(?,?,'OPEN',?,?)")
+          .run(nextId, nextMonth, nowIso(), req.auth.user.id);
+        next = db.prepare('SELECT * FROM accounting_periods WHERE id=?').get(nextId);
+      } else db.prepare("UPDATE accounting_periods SET status='OPEN',opened_at=?,opened_by=? WHERE id=?").run(nowIso(), req.auth.user.id, next.id);
+      const copy = db.prepare(`INSERT INTO period_balances(period_id,user_id,opening_balance)
+        SELECT ?,user_id,COALESCE(closing_balance,opening_balance) FROM period_balances WHERE period_id=?
+        ON CONFLICT(period_id,user_id) DO UPDATE SET opening_balance=excluded.opening_balance`);
+      copy.run(next.id, open.id);
+      audit(req.auth.user.id, 'CLOSE_PERIOD', 'ACCOUNTING_PERIOD', open.id, { status: 'OPEN' }, { status: 'CLOSED', nextMonth }, 'End of Month selesai');
+    });
+    close();
+    res.json({ ok: true, closedPeriodMonth: open.period_month, openPeriodMonth: nextMonth });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/periods/:periodMonth/reopen', authMiddleware, requireSuperUser, asyncRoute(async (req, res) => {
+  if (!hasPermission(req, 'periods.reopen')) throw new AppError('Anda tidak memiliki hak membuka kembali periode.', 403);
+  const target = db.prepare("SELECT * FROM accounting_periods WHERE period_month=? AND status='CLOSED'").get(String(req.params.periodMonth));
+  const open = getOpenPeriod();
+  if (!target || nextPeriodMonth(target.period_month) !== open.period_month) throw new AppError('Hanya periode terakhir sebelum periode terbuka yang dapat dibuka kembali.');
+  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  if (!user || !verifyPassword(String(req.body.currentPassword || ''), user.password_salt, user.password_hash)) throw new AppError('Password Super User tidak sesuai.', 401);
+  const reason = cleanText(req.body.reason, 500);
+  if (!reason) throw new AppError('Alasan membuka kembali periode wajib diisi.');
+  const bounds = monthBounds(open.period_month);
+  const activity = [
+    db.prepare('SELECT COUNT(*) AS total FROM transactions WHERE transaction_date BETWEEN ? AND ?').get(bounds.startDate, bounds.endDate).total,
+    db.prepare('SELECT COUNT(*) AS total FROM cash_transfers WHERE transfer_date BETWEEN ? AND ?').get(bounds.startDate, bounds.endDate).total,
+    db.prepare('SELECT COUNT(*) AS total FROM operational_advances WHERE advance_date BETWEEN ? AND ?').get(bounds.startDate, bounds.endDate).total,
+    db.prepare('SELECT COUNT(*) AS total FROM cash_budgets WHERE period_month=?').get(open.period_month).total
+  ].reduce((sum, count) => sum + Number(count), 0);
+  if (activity) throw new AppError('Periode baru sudah memiliki aktivitas atau pagu sehingga periode lama tidak aman untuk dibuka kembali.');
+  const destination = await backupDatabase('before-clear');
+  db.transaction(() => {
+    db.prepare('DELETE FROM accounting_periods WHERE id=?').run(open.id);
+    db.prepare(`UPDATE accounting_periods SET status='OPEN',closed_at=NULL,closed_by=NULL,close_note=NULL,
+      reopened_at=?,reopened_by=?,reopen_reason=? WHERE id=?`).run(nowIso(), req.auth.user.id, reason, target.id);
+    db.prepare('UPDATE period_balances SET closing_balance=NULL WHERE period_id=?').run(target.id);
+    audit(req.auth.user.id, 'REOPEN_PERIOD', 'ACCOUNTING_PERIOD', target.id, { status: 'CLOSED' }, { status: 'OPEN', reason, backup: path.basename(destination) }, 'Periode dibuka kembali');
+  })();
+  res.json({ ok: true, openPeriodMonth: target.period_month, backupFileName: path.basename(destination) });
+}));
+
 // ---------- Transfer kas antar-staff ----------
 
 function transferPublic(row) {
@@ -1043,8 +1383,7 @@ app.post('/api/transfers', authMiddleware, requirePermission('transfers.create')
     const amount = toAmount(req.body.amount);
     if (amount <= 0) throw new AppError('Nominal transfer harus lebih dari nol.');
     if (userBalance(req.auth.user.id) < amount) throw new AppError('Saldo kas tidak mencukupi.');
-    const transferDate = String(req.body.transferDate || localToday());
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(transferDate) || transferDate > localToday()) throw new AppError('Tanggal transfer tidak valid.');
+    const transferDate = assertOpenTransactionDate(req.body.transferDate || localToday(), 'Tanggal transfer');
     const description = cleanText(req.body.description, 500);
     if (!description) throw new AppError('Keterangan transfer wajib diisi.');
     let rawToken = '';
@@ -1144,9 +1483,8 @@ app.post('/api/umo', authMiddleware, requirePermission('umo.create'), (req, res,
     const bearerName = cleanText(req.body.bearerName, 120);
     const purpose = cleanText(req.body.purpose, 500);
     if (!bearerName || !purpose) throw new AppError('Pembawa uang dan keperluan wajib diisi.');
-    const advanceDate = String(req.body.advanceDate || localToday());
+    const advanceDate = assertOpenTransactionDate(req.body.advanceDate || localToday(), 'Tanggal UMO');
     const dueDate = String(req.body.dueDate || '');
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(advanceDate) || advanceDate > localToday()) throw new AppError('Tanggal UMO tidak valid.');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || dueDate < advanceDate) throw new AppError('Batas pertanggungjawaban tidak valid.');
     const needsApproval = amount > Number(getSetting('UMO_APPROVAL_LIMIT', 500000));
     const status = needsApproval ? 'PENDING' : 'OPEN';
@@ -1170,6 +1508,7 @@ app.post('/api/umo', authMiddleware, requirePermission('umo.create'), (req, res,
 
 app.post('/api/umo/:umoId/settlement', authMiddleware, upload.single('receipt'), (req, res, next) => {
   try {
+    assertOpenTransactionDate(localToday(), 'Tanggal pertanggungjawaban UMO');
     if (!hasPermission(req, 'umo.create') && !hasPermission(req, 'umo.view_all')) throw new AppError('Anda tidak memiliki akses pertanggungjawaban UMO.', 403);
     const umo = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(req.params.umoId);
     if (!umo || umo.status !== 'OPEN') throw new AppError('UMO tidak tersedia untuk dipertanggungjawabkan.', 404);
@@ -1352,6 +1691,7 @@ app.get('/api/corrections', authMiddleware, (req, res, next) => {
 
 app.post('/api/corrections', authMiddleware, requirePermission('corrections.create'), upload.single('receipt'), (req, res, next) => {
   try {
+    assertOpenTransactionDate(localToday(), 'Tanggal koreksi');
     const original = db.prepare('SELECT * FROM transactions WHERE id=?').get(String(req.body.originalTransactionId || ''));
     if (!original || original.status !== 'APPROVED') throw new AppError('Transaksi asal tidak dapat dikoreksi.');
     if (original.created_by !== req.auth.user.id && !hasPermission(req, 'corrections.view_all')) throw new AppError('Anda tidak memiliki akses ke transaksi tersebut.', 403);
@@ -1363,11 +1703,11 @@ app.post('/api/corrections', authMiddleware, requirePermission('corrections.crea
     if (!reason) throw new AppError('Alasan koreksi wajib diisi.');
     let proposed = { date: null, type: null, accountId: null, amount: null, description: null, counterparty: null };
     if (correctionType === 'REPLACEMENT') {
-      proposed = { date: String(req.body.transactionDate || original.transaction_date), type: String(req.body.type || original.type).toUpperCase(),
+      proposed = { date: assertOpenTransactionDate(req.body.transactionDate || localToday(), 'Tanggal transaksi pengganti'), type: String(req.body.type || original.type).toUpperCase(),
         accountId: String(req.body.accountId || original.account_id), amount: toAmount(req.body.amount || original.amount),
         description: cleanText(req.body.description || original.description, 500), counterparty: cleanText(req.body.counterparty || original.counterparty, 150) };
       const account = db.prepare('SELECT * FROM accounts WHERE id=? AND active=1').get(proposed.accountId);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(proposed.date) || proposed.date > localToday() || !['MASUK','KELUAR'].includes(proposed.type) ||
+      if (!['MASUK','KELUAR'].includes(proposed.type) ||
           !account || proposed.amount <= 0 || !proposed.description) throw new AppError('Data transaksi pengganti tidak valid.');
     }
     const id = newId('COR');
@@ -1545,9 +1885,10 @@ app.post('/api/admin/accounts', authMiddleware, requirePermission('accounts.mana
     if (!code || !name || !['MASUK', 'KELUAR', 'BOTH'].includes(scope)) throw new AppError('Data akun tidak valid.');
     const id = newId('ACC');
     const now = nowIso();
-    db.prepare('INSERT INTO accounts(id,code,name,transaction_scope,approval_limit,receipt_required,active,updated_by,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?,?)')
-      .run(id, code, name, scope, limit, Number(toBoolean(req.body.receiptRequired)), req.auth.user.id, now, now);
-    audit(req.auth.user.id, 'CREATE', 'ACCOUNT', id, '', { code, name, scope, limit }, 'Akun kas dibuat');
+    db.prepare(`INSERT INTO accounts(id,code,name,transaction_scope,approval_limit,receipt_required,underlying_required,active,updated_by,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,1,?,?,?)`)
+      .run(id, code, name, scope, limit, Number(toBoolean(req.body.receiptRequired)), Number(toBoolean(req.body.underlyingRequired)), req.auth.user.id, now, now);
+    audit(req.auth.user.id, 'CREATE', 'ACCOUNT', id, '', { code, name, scope, limit, receiptRequired: toBoolean(req.body.receiptRequired), underlyingRequired: toBoolean(req.body.underlyingRequired) }, 'Akun kas dibuat');
     res.status(201).json({ ok: true, accountId: id });
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) return next(new AppError('Kode akun sudah digunakan.'));
@@ -1564,11 +1905,12 @@ app.patch('/api/admin/accounts/:accountId', authMiddleware, requirePermission('a
     const scope = req.body.transactionScope === undefined ? target.transaction_scope : String(req.body.transactionScope).toUpperCase();
     const limit = req.body.approvalLimit === undefined ? target.approval_limit : Math.max(0, toAmount(req.body.approvalLimit));
     const required = req.body.receiptRequired === undefined ? target.receipt_required : Number(toBoolean(req.body.receiptRequired));
+    const underlyingRequired = req.body.underlyingRequired === undefined ? target.underlying_required : Number(toBoolean(req.body.underlyingRequired));
     const active = req.body.active === undefined ? target.active : Number(toBoolean(req.body.active));
     if (!code || !name || !['MASUK', 'KELUAR', 'BOTH'].includes(scope)) throw new AppError('Data akun tidak valid.');
-    db.prepare('UPDATE accounts SET code=?,name=?,transaction_scope=?,approval_limit=?,receipt_required=?,active=?,updated_by=?,updated_at=? WHERE id=?')
-      .run(code, name, scope, limit, required, active, req.auth.user.id, nowIso(), target.id);
-    audit(req.auth.user.id, 'UPDATE', 'ACCOUNT', target.id, accountPublic(target), { code, name, scope, limit, required, active }, 'Akun kas diperbarui');
+    db.prepare('UPDATE accounts SET code=?,name=?,transaction_scope=?,approval_limit=?,receipt_required=?,underlying_required=?,active=?,updated_by=?,updated_at=? WHERE id=?')
+      .run(code, name, scope, limit, required, underlyingRequired, active, req.auth.user.id, nowIso(), target.id);
+    audit(req.auth.user.id, 'UPDATE', 'ACCOUNT', target.id, accountPublic(target), { code, name, scope, limit, required, underlyingRequired, active }, 'Akun kas diperbarui');
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
@@ -1617,6 +1959,187 @@ function backupPublic(record) {
   };
 }
 
+function assertBackupPassword(password) {
+  const value = String(password || '');
+  if (value.length < 8 || value.length > 128) throw new AppError('Password backup minimal 8 karakter dan maksimal 128 karakter.');
+  return value;
+}
+
+function assertCurrentSuperUserPassword(req, password) {
+  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  if (!user || !verifyPassword(String(password || ''), user.password_salt, user.password_hash)) {
+    throw new AppError('Password Super User tidak sesuai.', 401);
+  }
+}
+
+function encryptedBackupBuffer(payload, password) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(password, salt, 32);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const compressed = zlib.gzipSync(Buffer.from(JSON.stringify(payload)), { level: 9 });
+  const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
+  const wrapper = {
+    format: 'KAS_KECIL_FULL_BACKUP', version: 1, algorithm: 'aes-256-gcm+scrypt+gzip',
+    salt: salt.toString('base64'), iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'),
+    data: encrypted.toString('base64')
+  };
+  return Buffer.from(`KKBACKUP1\n${JSON.stringify(wrapper)}`);
+}
+
+function decryptedBackupPayload(buffer, password) {
+  try {
+    const text = buffer.toString('utf8');
+    if (!text.startsWith('KKBACKUP1\n')) throw new Error('signature');
+    const wrapper = JSON.parse(text.slice('KKBACKUP1\n'.length));
+    if (wrapper.format !== 'KAS_KECIL_FULL_BACKUP' || Number(wrapper.version) !== 1) throw new Error('format');
+    const key = crypto.scryptSync(password, Buffer.from(wrapper.salt, 'base64'), 32);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(wrapper.iv, 'base64'));
+    decipher.setAuthTag(Buffer.from(wrapper.tag, 'base64'));
+    const compressed = Buffer.concat([decipher.update(Buffer.from(wrapper.data, 'base64')), decipher.final()]);
+    return JSON.parse(zlib.gunzipSync(compressed).toString('utf8'));
+  } catch {
+    throw new AppError('File atau password backup tidak valid.');
+  }
+}
+
+function uploadFilesForBackup() {
+  if (!fs.existsSync(UPLOAD_DIR)) return [];
+  return fs.readdirSync(UPLOAD_DIR, { withFileTypes: true })
+    .filter(entry => entry.isFile())
+    .map(entry => {
+      const filePath = path.join(UPLOAD_DIR, entry.name);
+      const stat = fs.statSync(filePath);
+      return { name: entry.name, size: stat.size, data: fs.readFileSync(filePath).toString('base64') };
+    });
+}
+
+function createFullBackupBuffer(password, actorId, purpose = 'export') {
+  audit(actorId, purpose === 'export' ? 'EXPORT_FULL_BACKUP' : 'BACKUP_BEFORE_RESTORE', 'DATABASE', '', '', '',
+    purpose === 'export' ? 'Export data lengkap dibuat' : 'Backup lengkap dibuat sebelum restore');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const snapshot = path.join(DATA_DIR, `full-backup-${crypto.randomUUID()}.sqlite`);
+  try {
+    db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+    db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+    const uploads = uploadFilesForBackup();
+    const payload = {
+      manifest: {
+        format: 'KAS_KECIL_FULL_BACKUP', version: 1, appVersion: APP_VERSION, createdAt: nowIso(),
+        purpose, uploadCount: uploads.length, databaseFile: 'kas-kecil.sqlite', containsSecurityPepper: true
+      },
+      database: fs.readFileSync(snapshot).toString('base64'),
+      uploads,
+      security: { appPepper: appPepperForBackup() }
+    };
+    return { buffer: encryptedBackupBuffer(payload, password), stamp, manifest: payload.manifest };
+  } finally {
+    try { if (fs.existsSync(snapshot)) fs.unlinkSync(snapshot); } catch (ignored) {}
+  }
+}
+
+function validateRestorePayload(payload, stageDir) {
+  if (payload?.manifest?.format !== 'KAS_KECIL_FULL_BACKUP' || !payload.database || !Array.isArray(payload.uploads) ||
+      !payload.security?.appPepper || String(payload.security.appPepper).length < 16) {
+    throw new AppError('Isi backup lengkap tidak valid.');
+  }
+  if (payload.uploads.length > 20000) throw new AppError('Jumlah lampiran dalam backup melebihi batas aman.');
+  fs.mkdirSync(stageDir, { recursive: true });
+  const candidateDb = path.join(stageDir, 'kas-kecil.sqlite');
+  fs.writeFileSync(candidateDb, Buffer.from(payload.database, 'base64'));
+  const candidate = new DatabaseSync(candidateDb, { readOnly: true });
+  try {
+    const result = candidate.prepare('PRAGMA quick_check').get();
+    if (String(Object.values(result || {})[0] || '').toLowerCase() !== 'ok') throw new Error('quick-check');
+    const required = new Set(['users', 'settings', 'audit_logs', 'transactions']);
+    candidate.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().forEach(row => required.delete(row.name));
+    if (required.size) throw new Error('schema');
+  } catch {
+    throw new AppError('Database di dalam backup rusak atau tidak kompatibel.');
+  } finally { candidate.close(); }
+  const uploadsDir = path.join(stageDir, 'uploads');
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  let totalSize = 0;
+  for (const file of payload.uploads) {
+    const name = path.basename(String(file.name || ''));
+    if (!name || name !== file.name) throw new AppError('Nama lampiran dalam backup tidak valid.');
+    const data = Buffer.from(String(file.data || ''), 'base64');
+    totalSize += data.length;
+    if (totalSize > 500 * 1024 * 1024) throw new AppError('Total lampiran dalam backup melebihi 500 MB.');
+    fs.writeFileSync(path.join(uploadsDir, name), data);
+  }
+  return { candidateDb, uploadsDir };
+}
+
+const fullBackupUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 250 * 1024 * 1024 },
+  fileFilter: (_req, file, callback) => callback(null, String(file.originalname || '').toLowerCase().endsWith('.kkbackup'))
+});
+
+app.post('/api/admin/full-backup/export', authMiddleware, requireSuperUser, (req, res, next) => {
+  try {
+    assertCurrentSuperUserPassword(req, req.body.currentPassword);
+    const password = assertBackupPassword(req.body.backupPassword);
+    const result = createFullBackupBuffer(password, req.auth.user.id, 'export');
+    const fileName = `Kas_Kecil_Lengkap_${result.stamp}.kkbackup`;
+    res.type('application/octet-stream');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(result.buffer);
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/full-backup/restore', authMiddleware, requireSuperUser, fullBackupUpload.single('backupFile'), asyncRoute(async (req, res) => {
+  if (String(req.body.confirmation || '').trim().toUpperCase() !== 'PULIHKAN SELURUH DATA') {
+    throw new AppError('Ketik PULIHKAN SELURUH DATA untuk mengonfirmasi restore.');
+  }
+  assertCurrentSuperUserPassword(req, req.body.currentPassword);
+  const password = assertBackupPassword(req.body.backupPassword);
+  if (!req.file?.buffer) throw new AppError('Pilih file backup lengkap berformat .kkbackup.');
+  const payload = decryptedBackupPayload(req.file.buffer, password);
+  const stageDir = path.join(DATA_DIR, `restore-${crypto.randomUUID()}`);
+  const staged = validateRestorePayload(payload, stageDir);
+  const current = createFullBackupBuffer(password, req.auth.user.id, 'before-restore');
+  const beforeRestoreName = `kas-kecil-full-before-restore-${current.stamp}.kkbackup`;
+  fs.writeFileSync(path.join(BACKUP_DIR, beforeRestoreName), current.buffer);
+
+  const oldDatabase = `${DB_PATH}.pre-restore`;
+  const oldUploads = `${UPLOAD_DIR}.pre-restore`;
+  const previousPepper = fs.existsSync(RESTORED_PEPPER_PATH) ? fs.readFileSync(RESTORED_PEPPER_PATH) : null;
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    db.close();
+    for (const file of [oldDatabase, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+      try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (ignored) {}
+    }
+    if (fs.existsSync(DB_PATH)) fs.renameSync(DB_PATH, oldDatabase);
+    fs.renameSync(staged.candidateDb, DB_PATH);
+    if (fs.existsSync(oldUploads)) fs.rmSync(oldUploads, { recursive: true, force: true });
+    if (fs.existsSync(UPLOAD_DIR)) fs.renameSync(UPLOAD_DIR, oldUploads);
+    fs.renameSync(staged.uploadsDir, UPLOAD_DIR);
+    installRestoredAppPepper(payload.security.appPepper);
+    fs.rmSync(stageDir, { recursive: true, force: true });
+    res.json({ ok: true, restarting: true, restoredFrom: payload.manifest.createdAt, beforeRestoreBackup: beforeRestoreName });
+    setTimeout(() => process.exit(0), 500);
+  } catch (error) {
+    try {
+      if (fs.existsSync(oldDatabase)) {
+        if (fs.existsSync(DB_PATH)) fs.unlinkSync(DB_PATH);
+        fs.renameSync(oldDatabase, DB_PATH);
+      }
+      if (fs.existsSync(oldUploads)) {
+        if (fs.existsSync(UPLOAD_DIR)) fs.rmSync(UPLOAD_DIR, { recursive: true, force: true });
+        fs.renameSync(oldUploads, UPLOAD_DIR);
+      }
+      if (previousPepper) fs.writeFileSync(RESTORED_PEPPER_PATH, previousPepper, { mode: 0o600 });
+      else if (fs.existsSync(RESTORED_PEPPER_PATH)) fs.unlinkSync(RESTORED_PEPPER_PATH);
+    } catch (ignored) {}
+    setTimeout(() => process.exit(1), 500);
+    throw error;
+  }
+}));
+
 app.get('/api/admin/database/backups', authMiddleware, requireSuperUser, (_req, res) => {
   res.json({ backups: listDatabaseBackups().map(backupPublic) });
 });
@@ -1650,7 +2173,8 @@ app.post('/api/admin/database/clear', authMiddleware, requireSuperUser, asyncRou
 
   const tableOrder = [
     'approval_requests', 'approvals', 'transaction_corrections', 'umo_allocations',
-    'ledger_entries', 'cash_transfers', 'operational_advances', 'transactions', 'sequences', 'audit_logs'
+    'ledger_entries', 'cash_transfers', 'operational_advances', 'transactions', 'sequences',
+    'cash_budget_allocations', 'cash_budgets', 'period_balances', 'accounting_periods', 'audit_logs'
   ];
   const destination = await backupDatabase('before-clear');
   const cleared = Object.fromEntries(tableOrder.map(table => [table, Number(db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get().total)]));
@@ -1660,6 +2184,7 @@ app.post('/api/admin/database/clear', authMiddleware, requireSuperUser, asyncRou
     db.prepare("UPDATE settings SET value='0',updated_by=?,updated_at=? WHERE key='LAST_TRANSACTION_SEQUENCE'").run(req.auth.user.id, nowIso());
   });
   clearOperationalData();
+  ensureAccountingPeriod(req.auth.user.id);
   const recordCount = Object.values(cleared).reduce((sum, count) => sum + count, 0);
   audit(req.auth.user.id, 'CLEAR_DATABASE', 'DATABASE', path.basename(destination), cleared, { recordCount: 0 }, 'Data transaksi direset setelah backup otomatis');
   const record = listDatabaseBackups().find(item => item.fileName === path.basename(destination));
@@ -1851,8 +2376,11 @@ app.use('/api', (_req, _res, next) => next(new AppError('Endpoint tidak ditemuka
 app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 
 app.use((error, req, res, _next) => {
-  if (req.file && req.file.path && fs.existsSync(req.file.path)) {
-    try { fs.unlinkSync(req.file.path); } catch (ignored) {}
+  const uploaded = [req.file, ...Object.values(req.files || {}).flat()].filter(Boolean);
+  for (const file of uploaded) {
+    if (file.path && fs.existsSync(file.path)) {
+      try { fs.unlinkSync(file.path); } catch (ignored) {}
+    }
   }
   const status = Number(error.status || (error.code === 'LIMIT_FILE_SIZE' ? 400 : 500));
   const message = error.code === 'LIMIT_FILE_SIZE'
@@ -1868,7 +2396,7 @@ cron.schedule('30 2 * * *', async () => {
 }, { timezone: APP_TIMEZONE() });
 
 app.listen(PORT, '0.0.0.0', () => {
-  if (!process.env.APP_PEPPER || process.env.APP_PEPPER === 'change-this-pepper-before-production') {
+  if (appPepperForBackup() === 'change-this-pepper-before-production') {
     console.warn('PERINGATAN: APP_PEPPER belum diubah. Atur secret yang kuat sebelum digunakan.');
   }
   console.log(`Aplikasi Kas Kecil berjalan di port ${PORT}`);

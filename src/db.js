@@ -65,6 +65,7 @@ function initDatabase() {
       transaction_scope TEXT NOT NULL CHECK(transaction_scope IN ('MASUK','KELUAR','BOTH')),
       approval_limit INTEGER NOT NULL DEFAULT 0,
       receipt_required INTEGER NOT NULL DEFAULT 1,
+      underlying_required INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1,
       updated_by TEXT,
       created_at TEXT NOT NULL,
@@ -84,6 +85,9 @@ function initDatabase() {
       receipt_path TEXT,
       receipt_original_name TEXT,
       receipt_mime TEXT,
+      underlying_path TEXT,
+      underlying_original_name TEXT,
+      underlying_mime TEXT,
       status TEXT NOT NULL CHECK(status IN ('PENDING','APPROVED','REJECTED','CORRECTED')),
       created_by TEXT NOT NULL,
       created_at TEXT NOT NULL,
@@ -288,6 +292,52 @@ function initDatabase() {
       description TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_logs(timestamp DESC);
+
+    CREATE TABLE IF NOT EXISTS accounting_periods (
+      id TEXT PRIMARY KEY,
+      period_month TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL CHECK(status IN ('OPEN','CLOSED')),
+      opened_at TEXT NOT NULL,
+      opened_by TEXT NOT NULL,
+      closed_at TEXT,
+      closed_by TEXT,
+      close_note TEXT,
+      reopened_at TEXT,
+      reopened_by TEXT,
+      reopen_reason TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS period_balances (
+      period_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      opening_balance INTEGER NOT NULL DEFAULT 0,
+      closing_balance INTEGER,
+      PRIMARY KEY(period_id,user_id),
+      FOREIGN KEY(period_id) REFERENCES accounting_periods(id) ON DELETE CASCADE,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS cash_budgets (
+      id TEXT PRIMARY KEY,
+      period_month TEXT NOT NULL UNIQUE,
+      total_budget INTEGER NOT NULL CHECK(total_budget >= 0),
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_by TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(created_by) REFERENCES users(id),
+      FOREIGN KEY(updated_by) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS cash_budget_allocations (
+      budget_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      percentage_bps INTEGER NOT NULL CHECK(percentage_bps >= 0 AND percentage_bps <= 10000),
+      allocated_amount INTEGER NOT NULL CHECK(allocated_amount >= 0),
+      PRIMARY KEY(budget_id,account_id),
+      FOREIGN KEY(budget_id) REFERENCES cash_budgets(id) ON DELETE CASCADE,
+      FOREIGN KEY(account_id) REFERENCES accounts(id)
+    );
   `);
 
   rebuildLegacyTransactionsIfNeeded();
@@ -298,6 +348,10 @@ function initDatabase() {
   ensureColumn('transactions', 'source_type', "TEXT NOT NULL DEFAULT 'DIRECT'");
   ensureColumn('transactions', 'source_id', 'TEXT');
   ensureColumn('approval_requests', 'token_ciphertext', 'TEXT');
+  ensureColumn('accounts', 'underlying_required', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('transactions', 'underlying_path', 'TEXT');
+  ensureColumn('transactions', 'underlying_original_name', 'TEXT');
+  ensureColumn('transactions', 'underlying_mime', 'TEXT');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_approval_pin_fingerprint ON users(approval_pin_fingerprint) WHERE approval_pin_fingerprint IS NOT NULL;');
 
   const defaults = [
@@ -334,7 +388,38 @@ function initDatabase() {
   `);
 
   seedInitialAdmin();
+  ensureAccountingPeriod();
   cleanupExpiredSessions();
+}
+
+function localPeriodMonth(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: String(getSetting('TIMEZONE', 'Asia/Jakarta')),
+    year: 'numeric', month: '2-digit'
+  }).format(date);
+}
+
+function ensureAccountingPeriod(actorId = 'SYSTEM') {
+  const open = db.prepare("SELECT * FROM accounting_periods WHERE status='OPEN' ORDER BY period_month DESC LIMIT 1").get();
+  if (open) return open;
+  const periodMonth = localPeriodMonth();
+  const existing = db.prepare('SELECT * FROM accounting_periods WHERE period_month=?').get(periodMonth);
+  if (existing) {
+    db.prepare("UPDATE accounting_periods SET status='OPEN',opened_at=?,opened_by=? WHERE id=?")
+      .run(nowIso(), actorId, existing.id);
+    return db.prepare('SELECT * FROM accounting_periods WHERE id=?').get(existing.id);
+  }
+  const periodId = newId('PER');
+  const firstDate = `${periodMonth}-01`;
+  db.prepare("INSERT INTO accounting_periods(id,period_month,status,opened_at,opened_by) VALUES(?,?,'OPEN',?,?)")
+    .run(periodId, periodMonth, nowIso(), actorId);
+  const users = db.prepare('SELECT id FROM users WHERE active=1').all();
+  const balance = db.prepare(`SELECT COALESCE(SUM(CASE WHEN direction='IN' THEN amount ELSE -amount END),0) AS total
+    FROM ledger_entries WHERE user_id=? AND entry_date<?`);
+  const insert = db.prepare('INSERT INTO period_balances(period_id,user_id,opening_balance) VALUES(?,?,?)');
+  const seed = db.transaction(() => users.forEach(user => insert.run(periodId, user.id, Number(balance.get(user.id, firstDate).total || 0))));
+  seed();
+  return db.prepare('SELECT * FROM accounting_periods WHERE id=?').get(periodId);
 }
 
 function rebuildLegacyTransactionsIfNeeded() {
@@ -522,5 +607,7 @@ module.exports = {
   audit,
   cleanupExpiredSessions,
   backupDatabase,
-  listDatabaseBackups
+  listDatabaseBackups,
+  ensureAccountingPeriod,
+  localPeriodMonth
 };

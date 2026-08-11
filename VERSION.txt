@@ -1,6 +1,6 @@
 Kas Kecil untuk CasaOS dan Linux
-Versi: 1.4.0
-Tanggal: 2026-08-11
+Versi: 1.5.0
+Tanggal: 2026-08-12
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
@@ -30,3 +30,9 @@ Fitur utama:
 - Rekap total dana per akun dengan filter tanggal dan export Excel/PDF
 - Pemeliharaan data khusus Super User dengan backup manual dan riwayat backup
 - Reset data transaksi aman dengan backup historis otomatis sebelum penghapusan
+- Sidebar accordion desktop/mobile dan informasi versi aplikasi
+- Filter periode Dashboard dengan default bulan berjalan
+- Export/restore data lengkap terenkripsi untuk pemindahan server
+- Perbandingan dana per akun antarbulan dengan cakupan hak akses pengguna
+- Underlying document opsional/wajib per akun untuk dasar pengeluaran
+- Pagu kas bulanan per akun, periode terkunci, dan proses End of Month

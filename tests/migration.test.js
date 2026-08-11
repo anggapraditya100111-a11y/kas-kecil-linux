@@ -47,5 +47,11 @@ test('database v1.0 dimigrasikan tanpa kehilangan transaksi', () => {
   assert(db.prepare('PRAGMA table_info(approval_requests)').all().some(column => column.name === 'token_ciphertext'));
   assert.equal(db.prepare("SELECT value FROM settings WHERE key='THEME_COLOR'").get().value, '#1d4ed8');
   assert.equal(db.prepare("SELECT value FROM settings WHERE key='COMPANY_LOGO_FILE'").get().value, '');
+  assert(db.prepare('PRAGMA table_info(accounts)').all().some(column => column.name === 'underlying_required'));
+  assert(db.prepare('PRAGMA table_info(transactions)').all().some(column => column.name === 'underlying_path'));
+  for (const table of ['accounting_periods', 'period_balances', 'cash_budgets', 'cash_budget_allocations']) {
+    assert(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table), `${table} belum dibuat`);
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) AS total FROM accounting_periods WHERE status='OPEN'").get().total, 1);
   assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0);
 });

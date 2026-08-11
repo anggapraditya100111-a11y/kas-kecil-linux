@@ -91,6 +91,9 @@ test('branding, warna tema, dark mode, dan navigasi mobile tersedia', () => {
   assert.match(styles, /html\[data-theme="dark"\]/);
   assert.match(styles, /@media \(max-width:900px\)/);
   assert.match(styles, /body\.nav-open \.sidebar/);
+  assert.match(client, /nav-group-toggle/);
+  assert.match(html, /Create By Apraditya/);
+  assert.match(html, /id="sidebar-version"/);
 });
 
 test('bukti dapat dipilih dari kamera perangkat', () => {
@@ -121,6 +124,25 @@ test('rekap dana per akun menyediakan filter dan export', () => {
   assert.match(server, /t\.status='APPROVED'/);
 });
 
+test('fitur periode, pagu, perbandingan, dan underlying document terhubung', () => {
+  for (const feature of ['Pagu Kas', 'Perbandingan Dana per Akun', 'Underlying document', 'End of Month']) assert.match(client, new RegExp(feature));
+  assert.match(server, /api\/budgets\/current/);
+  assert.match(server, /api\/periods\/eom/);
+  assert.match(server, /api\/account-comparison/);
+  assert.match(server, /underlying_required/);
+  assert.match(server, /assertOpenTransactionDate/);
+});
+
+test('backup lengkap terenkripsi mendukung export dan restore', () => {
+  assert.match(client, /\.kkbackup/);
+  assert.match(client, /PULIHKAN SELURUH DATA/);
+  assert.match(server, /aes-256-gcm/);
+  assert.match(server, /api\/admin\/full-backup\/export/);
+  assert.match(server, /api\/admin\/full-backup\/restore/);
+  assert.match(server, /BACKUP_BEFORE_RESTORE/);
+  assert.match(server, /installRestoredAppPepper/);
+});
+
 test('reset database dilindungi dan selalu membuat backup historical', () => {
   assert.match(client, /HAPUS DATA TRANSAKSI/);
   assert.match(client, /api\/admin\/database\/clear/);
@@ -131,8 +153,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.4\.0/);
-  assert.match(html, /app\.js\?v=1\.4\.0/);
+  assert.match(html, /styles\.css\?v=1\.5\.0/);
+  assert.match(html, /app\.js\?v=1\.5\.0/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);

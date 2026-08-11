@@ -14,7 +14,13 @@ const PERMISSION_CATALOG = Object.freeze([
   { code: 'reports.export_all', group: 'Laporan', label: 'Export seluruh transaksi' },
   { code: 'account_summary.view', group: 'Laporan', label: 'Melihat rekap dana seluruh akun' },
   { code: 'account_summary.export', group: 'Laporan', label: 'Export rekap dana seluruh akun' },
+  { code: 'account_comparison.view', group: 'Laporan', label: 'Melihat perbandingan dana per akun' },
+  { code: 'account_comparison.view_all_users', group: 'Laporan', label: 'Memfilter perbandingan seluruh pengguna' },
   { code: 'accounts.view', group: 'Akun Kas', label: 'Melihat daftar akun dan limit' },
+  { code: 'budgets.view', group: 'Pagu Kas', label: 'Melihat pagu dan sisa pagu kas' },
+  { code: 'budgets.manage', group: 'Pagu Kas', label: 'Menetapkan pagu dan persentase akun' },
+  { code: 'periods.close', group: 'Periode', label: 'Menjalankan End of Month' },
+  { code: 'periods.reopen', group: 'Periode', label: 'Membuka kembali periode (khusus Super User)' },
   { code: 'transfers.create', group: 'Transfer Kas', label: 'Mengajukan transfer kas antar-staff' },
   { code: 'transfers.view_self', group: 'Transfer Kas', label: 'Melihat transfer terkait diri sendiri' },
   { code: 'transfers.view_all', group: 'Transfer Kas', label: 'Melihat seluruh transfer kas' },
@@ -39,7 +45,9 @@ const ROLE_DEFAULTS = Object.freeze({
     'mutations.view_self',
     'receipts.view_self',
     'reports.export_self',
+    'account_comparison.view',
     'accounts.view',
+    'budgets.view',
     'transfers.create',
     'transfers.view_self',
     'umo.create',
@@ -57,7 +65,12 @@ const ROLE_DEFAULTS = Object.freeze({
     'reports.export_all',
     'account_summary.view',
     'account_summary.export',
+    'account_comparison.view',
+    'account_comparison.view_all_users',
     'accounts.view',
+    'budgets.view',
+    'budgets.manage',
+    'periods.close',
     'transfers.view_all',
     'umo.view_all',
     'corrections.view_all'
@@ -79,6 +92,7 @@ function effectivePermissions(role, overrides = []) {
     return new Set(PERMISSION_CATALOG.map(item => item.code));
   }
   permissions.delete('database.manage');
+  permissions.delete('periods.reopen');
   return permissions;
 }
 

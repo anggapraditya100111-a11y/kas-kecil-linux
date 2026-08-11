@@ -1,6 +1,40 @@
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 
-const APP_PEPPER = process.env.APP_PEPPER || 'change-this-pepper-before-production';
+const SECURITY_DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const RESTORED_PEPPER_PATH = path.join(SECURITY_DATA_DIR, '.restored-app-pepper');
+
+function validPepper(value) {
+  const text = String(value || '').trim();
+  return text.length >= 16 && text.length <= 512 && !text.includes('\0');
+}
+
+function resolveAppPepper() {
+  try {
+    if (fs.existsSync(RESTORED_PEPPER_PATH)) {
+      const restored = fs.readFileSync(RESTORED_PEPPER_PATH, 'utf8').trim();
+      if (validPepper(restored)) return restored;
+    }
+  } catch (ignored) {}
+  return process.env.APP_PEPPER || 'change-this-pepper-before-production';
+}
+
+const APP_PEPPER = resolveAppPepper();
+
+function appPepperForBackup() {
+  return APP_PEPPER;
+}
+
+function installRestoredAppPepper(value) {
+  const pepper = String(value || '').trim();
+  if (!validPepper(pepper)) throw new Error('Pepper keamanan pada backup tidak valid.');
+  fs.mkdirSync(SECURITY_DATA_DIR, { recursive: true });
+  const temporary = `${RESTORED_PEPPER_PATH}.${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(temporary, pepper, { mode: 0o600 });
+  fs.renameSync(temporary, RESTORED_PEPPER_PATH);
+  try { fs.chmodSync(RESTORED_PEPPER_PATH, 0o600); } catch (ignored) {}
+}
 
 function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
@@ -93,6 +127,9 @@ module.exports = {
   verifyApprovalPin,
   approvalPinFingerprint,
   assertApprovalPin,
+  appPepperForBackup,
+  installRestoredAppPepper,
+  RESTORED_PEPPER_PATH,
   newId,
   cleanText
 };

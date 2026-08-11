@@ -3,14 +3,29 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'kas-kecil-v14-'));
+const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'kas-kecil-v15-'));
 process.env.PORT = process.env.PORT || '18090';
 process.env.DATA_DIR = path.join(runtime, 'data');
 process.env.UPLOAD_DIR = path.join(runtime, 'uploads');
 process.env.BACKUP_DIR = path.join(runtime, 'backups');
-process.env.APP_PEPPER = 'integration-secret-v14-1234567890';
+process.env.APP_PEPPER = 'integration-secret-v15-1234567890';
 process.env.INITIAL_ADMIN_PASSWORD = 'Admin12345';
 process.env.NODE_ENV = 'test';
+process.env.APP_TIMEZONE = 'Asia/Jakarta';
+
+function businessDate(offsetDays = 0) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: process.env.APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date(Date.now() + offsetDays * 86400000));
+  const value = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+}
+
+const today = businessDate();
+const currentMonth = today.slice(0, 7);
 
 const baseUrl = `http://127.0.0.1:${process.env.PORT}`;
 
@@ -75,11 +90,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.4.0');
+  assert.equal(health.version, '1.5.0');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.4.0', '/styles.css?v=1.4.0']) {
+  for (const asset of ['/app.js?v=1.5.0', '/styles.css?v=1.5.0']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -102,7 +117,7 @@ async function main() {
 
   const outgoing = await request('/api/admin/accounts', {
     cookie: admin, method: 'POST', expected: 201,
-    body: { accountCode: 'OPS', accountName: 'Operasional', transactionScope: 'KELUAR', approvalLimit: 500, receiptRequired: true }
+    body: { accountCode: 'OPS', accountName: 'Operasional', transactionScope: 'KELUAR', approvalLimit: 500, receiptRequired: true, underlyingRequired: true }
   });
   const incoming = await request('/api/admin/accounts', {
     cookie: admin, method: 'POST', expected: 201,
@@ -130,9 +145,14 @@ async function main() {
   const spvAccess = access.users.find(user => user.userId === spvResult.userId);
   assert(staffAccess.effectivePermissions.includes('mutations.view_self'));
   assert(staffAccess.effectivePermissions.includes('umo.create'));
+  assert(staffAccess.effectivePermissions.includes('budgets.view'));
+  assert(staffAccess.effectivePermissions.includes('account_comparison.view'));
   assert(!spvAccess.effectivePermissions.includes('transactions.create'));
   assert(spvAccess.effectivePermissions.includes('mutations.view_all'));
   assert(spvAccess.effectivePermissions.includes('account_summary.view'));
+  assert(spvAccess.effectivePermissions.includes('budgets.manage'));
+  assert(spvAccess.effectivePermissions.includes('periods.close'));
+  assert(spvAccess.effectivePermissions.includes('account_comparison.view_all_users'));
   assert(!spvAccess.effectivePermissions.includes('database.manage'));
   assert.equal(spvAccess.hasApprovalPin, true);
 
@@ -140,9 +160,19 @@ async function main() {
   const staffB = await login('staff.b', 'Staff12345');
   const accounts = await request('/api/accounts', { cookie: staffA });
   assert.equal(accounts.accounts.length, 2);
+  assert.equal(accounts.accounts.find(account => account.accountId === outgoing.accountId).underlyingRequired, true);
+
+  const initialBudget = await request('/api/budgets/current', { cookie: admin });
+  assert.equal(initialBudget.periodStatus, 'OPEN');
+  await request(`/api/budgets/${initialBudget.periodMonth}`, {
+    cookie: admin, method: 'PUT', body: { totalBudget: 20000, allocations: [{ accountId: outgoing.accountId, percentageBps: 10000 }] }
+  });
+  const staffBudget = await request('/api/budgets/current', { cookie: staffA });
+  assert.equal(staffBudget.totalBudget, 20000);
+  assert.equal(staffBudget.allocations[0].allocatedAmount, 20000);
 
   const cashIn = new FormData();
-  cashIn.set('type', 'MASUK'); cashIn.set('transactionDate', new Date().toISOString().slice(0, 10));
+  cashIn.set('type', 'MASUK'); cashIn.set('transactionDate', today);
   cashIn.set('accountId', incoming.accountId); cashIn.set('amount', '10000'); cashIn.set('description', 'Pengisian kas awal');
   const inResult = await request('/api/transactions', { cookie: staffA, method: 'POST', form: cashIn, expected: 201 });
   assert.equal(inResult.status, 'APPROVED');
@@ -152,10 +182,11 @@ async function main() {
   integrationDb.prepare("DELETE FROM sequences WHERE prefix='KSK'").run();
 
   const cashOut = new FormData();
-  cashOut.set('type', 'KELUAR'); cashOut.set('transactionDate', new Date().toISOString().slice(0, 10));
+  cashOut.set('type', 'KELUAR'); cashOut.set('transactionDate', today);
   cashOut.set('accountId', outgoing.accountId); cashOut.set('amount', '1000'); cashOut.set('description', 'Pembelian perlengkapan');
   cashOut.set('counterparty', 'Toko Contoh');
   cashOut.set('receipt', new Blob([Buffer.from('%PDF-1.4\n%%EOF')], { type: 'application/pdf' }), 'bukti.pdf');
+  cashOut.set('underlyingDocument', new Blob([Buffer.from('%PDF-1.4\nunderlying\n%%EOF')], { type: 'application/pdf' }), 'surat-permintaan.pdf');
   const outResult = await request('/api/transactions', { cookie: staffA, method: 'POST', form: cashOut, expected: 201 });
   assert.equal(outResult.status, 'PENDING');
   const pendingApprovals = await request('/api/approvals', { cookie: admin });
@@ -166,6 +197,8 @@ async function main() {
   const transactionApproval = await approvePublic(outResult.approvalUrl);
   assert.equal(transactionApproval.entityType, 'TRANSACTION');
   await assertDownload(transactionApproval.receiptUrl, null, /application\/pdf/, 10);
+  assert.match(transactionApproval.underlyingUrl, /\/underlying$/);
+  await assertDownload(transactionApproval.underlyingUrl, null, /application\/pdf/, 10);
 
   let mutationsA = await request('/api/mutations', { cookie: staffA });
   assert.equal(mutationsA.balance, 9000);
@@ -173,7 +206,7 @@ async function main() {
 
   const transfer = await request('/api/transfers', {
     cookie: staffA, method: 'POST', expected: 201,
-    body: { transferDate: new Date().toISOString().slice(0, 10), recipientUserId: staffBResult.userId, amount: 2000, description: 'Penyerahan kas operasional' }
+    body: { transferDate: today, recipientUserId: staffBResult.userId, amount: 2000, description: 'Penyerahan kas operasional' }
   });
   assert.equal((await approvePublic(transfer.approvalUrl)).entityType, 'TRANSFER');
   mutationsA = await request('/api/mutations', { cookie: staffA });
@@ -183,7 +216,7 @@ async function main() {
 
   const umo = await request('/api/umo', {
     cookie: staffA, method: 'POST', expected: 201,
-    body: { advanceDate: new Date().toISOString().slice(0, 10), dueDate: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10),
+    body: { advanceDate: today, dueDate: businessDate(3),
       bearerName: 'Teknisi A', advanceAmount: 400, purpose: 'Pembelian kebutuhan lapangan' }
   });
   assert.equal(umo.status, 'OPEN');
@@ -205,7 +238,7 @@ async function main() {
 
   const correction = new FormData();
   correction.set('originalTransactionId', outResult.transactionId); correction.set('correctionType', 'REPLACEMENT');
-  correction.set('reason', 'Nominal pada nota salah input'); correction.set('transactionDate', new Date().toISOString().slice(0, 10));
+  correction.set('reason', 'Nominal pada nota salah input'); correction.set('transactionDate', today);
   correction.set('type', 'KELUAR'); correction.set('accountId', outgoing.accountId); correction.set('amount', '800');
   correction.set('description', 'Pembelian perlengkapan terkoreksi'); correction.set('counterparty', 'Toko Contoh');
   const correctionResult = await request('/api/corrections', { cookie: staffA, method: 'POST', form: correction, expected: 201 });
@@ -218,17 +251,30 @@ async function main() {
   const staffDashboard = await request('/api/dashboard', { cookie: staffA });
   assert.equal(staffDashboard.cashBalance, 6850);
   assert.equal(staffDashboard.umoOutstanding, 0);
+  assert.equal(staffDashboard.startDate, `${currentMonth}-01`);
+  const filteredDashboard = await request(`/api/dashboard?startDate=${today}&endDate=${today}`, { cookie: staffA });
+  assert.equal(filteredDashboard.endDate, today);
   const ledger = await request('/api/ledger', { cookie: staffA });
   assert(ledger.rows.some(row => row.status === 'CORRECTED'));
   assert(ledger.rows.some(row => row.sourceType === 'UMO' && row.cashEffect === false));
 
-  const accountSummary = await request(`/api/account-summary?startDate=${new Date().toISOString().slice(0, 10)}&endDate=${new Date().toISOString().slice(0, 10)}`, { cookie: admin });
+  const accountSummary = await request(`/api/account-summary?startDate=${today}&endDate=${today}`, { cookie: admin });
   const outgoingSummary = accountSummary.rows.find(row => row.accountId === outgoing.accountId);
   const incomingSummary = accountSummary.rows.find(row => row.accountId === incoming.accountId);
   assert.equal(outgoingSummary.transactionCount, 2, 'Transaksi asal yang dikoreksi harus dikeluarkan dari rekap akun');
   assert.equal(outgoingSummary.totalOut, 1150, 'Realisasi UMO dan transaksi pengganti harus masuk rekap akun');
   assert.equal(incomingSummary.totalIn, 10000);
   assert.equal(accountSummary.totals.netAmount, 8850);
+  const staffComparison = await request(`/api/account-comparison?month1=${currentMonth}&month2=${currentMonth}&userId=${staffBResult.userId}`, { cookie: staffA });
+  assert.equal(staffComparison.canViewAll, false);
+  assert.equal(staffComparison.rows.find(row => row.accountId === outgoing.accountId).month1Amount, 1150);
+  const adminComparison = await request(`/api/account-comparison?month1=${currentMonth}&month2=${currentMonth}&userId=ALL`, { cookie: admin });
+  assert.equal(adminComparison.canViewAll, true);
+  assert.equal(adminComparison.rows.find(row => row.accountId === outgoing.accountId).difference, 0);
+  const usedBudget = await request('/api/budgets/current', { cookie: staffA });
+  assert.equal(usedBudget.allocations[0].usedAmount, 1150);
+  assert.equal(usedBudget.allocations[0].remainingAmount, 18850);
+  await request('/api/periods/eom', { cookie: admin, method: 'POST', body: {}, expected: 400 });
   await request('/api/account-summary?startDate=2026-02-30', { cookie: admin, expected: 400 });
   await request('/api/account-summary', { cookie: staffA, expected: 403 });
 
@@ -246,6 +292,20 @@ async function main() {
   await request('/api/admin/database/clear', { cookie: spv, method: 'POST', body: { currentPassword: 'Supervisor12345', confirmation: 'HAPUS DATA TRANSAKSI' }, expected: 403 });
   await request('/api/admin/database/clear', { cookie: admin, method: 'POST', body: { currentPassword: 'salah-password', confirmation: 'HAPUS DATA TRANSAKSI' }, expected: 401 });
 
+  const fullExportResponse = await fetch(`${baseUrl}/api/admin/full-backup/export`, {
+    method: 'POST', headers: { Cookie: admin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ currentPassword: 'Admin12345', backupPassword: 'BackupRahasia123' })
+  });
+  assert.equal(fullExportResponse.status, 200);
+  assert.match(fullExportResponse.headers.get('content-disposition') || '', /\.kkbackup/);
+  const fullExportBytes = Buffer.from(await fullExportResponse.arrayBuffer());
+  assert(fullExportBytes.toString('utf8', 0, 10).startsWith('KKBACKUP1'));
+  const invalidRestore = new FormData();
+  invalidRestore.set('backupFile', new Blob([fullExportBytes], { type: 'application/octet-stream' }), 'data.kkbackup');
+  invalidRestore.set('currentPassword', 'salah-password'); invalidRestore.set('backupPassword', 'BackupRahasia123');
+  invalidRestore.set('confirmation', 'PULIHKAN SELURUH DATA');
+  await request('/api/admin/full-backup/restore', { cookie: admin, method: 'POST', form: invalidRestore, expected: 401 });
+
   const cleared = await request('/api/admin/database/clear', {
     cookie: admin, method: 'POST', body: { currentPassword: 'Admin12345', confirmation: 'HAPUS DATA TRANSAKSI' }
   });
@@ -256,6 +316,8 @@ async function main() {
   }
   assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM users').get().total, 4, 'Pengguna harus dipertahankan');
   assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM accounts').get().total, 2, 'Akun harus dipertahankan');
+  assert.equal(integrationDb.prepare("SELECT COUNT(*) AS total FROM accounting_periods WHERE status='OPEN'").get().total, 1, 'Periode terbuka harus dibuat kembali');
+  assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM cash_budgets').get().total, 0, 'Pagu lama harus dibersihkan');
   assert.equal((await request('/api/account-summary', { cookie: admin })).totals.transactionCount, 0);
   const backupHistory = await request('/api/admin/database/backups', { cookie: admin });
   assert(backupHistory.backups.some(backup => backup.fileName === cleared.backup.fileName && backup.type === 'BEFORE_CLEAR'));
@@ -264,10 +326,11 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.4.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.5.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
-    accountSummary: true, accountSummaryExport: true, protectedDatabaseReset: true, historicalBackup: true
+    accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,
+    monthlyBudget: true, monthlyPeriodLock: true, fullEncryptedBackup: true, protectedDatabaseReset: true, historicalBackup: true
   }, null, 2));
 }
 
