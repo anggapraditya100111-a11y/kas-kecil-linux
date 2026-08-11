@@ -4,6 +4,7 @@ Tanggal: 2026-08-11
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
+Repository publik: https://github.com/anggapraditya100111-a11y/kas-kecil-linux
 
 Fitur utama:
 - Hak akses granular per pengguna
