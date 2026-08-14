@@ -90,11 +90,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.5.1');
+  assert.equal(health.version, '1.5.2');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.5.1', '/styles.css?v=1.5.1']) {
+  for (const asset of ['/app.js?v=1.5.2', '/styles.css?v=1.5.2']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -189,9 +189,12 @@ async function main() {
   cashOut.set('underlyingDocument', new Blob([Buffer.from('%PDF-1.4\nunderlying\n%%EOF')], { type: 'application/pdf' }), 'surat-permintaan.pdf');
   const outResult = await request('/api/transactions', { cookie: staffA, method: 'POST', form: cashOut, expected: 201 });
   assert.equal(outResult.status, 'PENDING');
+  integrationDb.prepare("UPDATE approval_requests SET expires_at='2000-01-01T00:00:00.000Z' WHERE entity_type='TRANSACTION' AND entity_id=?")
+    .run(outResult.transactionId);
   const pendingApprovals = await request('/api/approvals', { cookie: admin });
   const transactionPending = pendingApprovals.rows.find(row => row.entityId === outResult.transactionId);
   assert(transactionPending?.approvalId, 'Pending transaction approval is missing');
+  assert.equal(transactionPending.expired, undefined);
   const persistentLink = await request(`/api/approvals/${transactionPending.approvalId}/link`, { cookie: staffA, method: 'POST' });
   assert.equal(persistentLink.approvalUrl, outResult.approvalUrl);
   const transactionApproval = await approvePublic(outResult.approvalUrl);
@@ -326,7 +329,7 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.5.1', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.5.2', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,

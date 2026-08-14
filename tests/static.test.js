@@ -155,8 +155,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.5\.1/);
-  assert.match(html, /app\.js\?v=1\.5\.1/);
+  assert.match(html, /styles\.css\?v=1\.5\.2/);
+  assert.match(html, /app\.js\?v=1\.5\.2/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
@@ -199,4 +199,12 @@ test('builder menghasilkan tree publik tanpa file khusus private', { skip: !isPr
   }
   assert.equal(fs.existsSync(path.join(target, '.github', 'workflows', 'test.yml')), true);
   fs.rmSync(target, { recursive: true, force: true });
+});
+
+
+test('tautan approval tidak memiliki masa kedaluwarsa', () => {
+  assert.match(server, /APPROVAL_NO_EXPIRY/);
+  assert.match(server, /WHERE decision='PENDING' ORDER BY created_at ASC/);
+  assert.doesNotMatch(server, /Approval sudah kedaluwarsa/);
+  assert.doesNotMatch(client, /Durasi token approval|setting-approval|Tautan approval sudah kedaluwarsa/);
 });

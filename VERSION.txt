@@ -1,6 +1,6 @@
 Kas Kecil untuk CasaOS dan Linux
-Versi: 1.5.1
-Tanggal: 2026-08-12
+Versi: 1.5.2
+Tanggal: 2026-08-14
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
@@ -36,3 +36,5 @@ Fitur utama:
 - Perbandingan dana per akun antarbulan dengan cakupan hak akses pengguna
 - Underlying document opsional/wajib per akun untuk dasar pengeluaran
 - Pagu kas bulanan per akun, periode terkunci, dan proses End of Month
+
+- Tautan approval tidak memiliki masa kedaluwarsa dan tetap dilindungi PIN serta status pengajuan

@@ -51,7 +51,8 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.1';
+const APP_VERSION = '1.5.2';
+const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
 const DEFAULT_COMPANY_NAME = process.env.DEFAULT_COMPANY_NAME || 'Nama Perusahaan';
@@ -355,18 +356,16 @@ function postTransactionLedger(tx, actorId) {
 
 function createApprovalRequest(entityType, entityId) {
   const rawToken = randomToken();
-  const hours = Number(getSetting('APPROVAL_TOKEN_HOURS', 24)) || 24;
   db.prepare(`INSERT INTO approval_requests(id,entity_type,entity_id,token_hash,token_ciphertext,expires_at,decision,created_at)
     VALUES(?,?,?,?,?,?,'PENDING',?)`).run(
     newId('APR'), entityType, entityId, hashToken('APPROVAL', rawToken), encryptSecret(rawToken),
-    new Date(Date.now() + hours * 60 * 60 * 1000).toISOString(), nowIso()
+    APPROVAL_NO_EXPIRY, nowIso()
   );
   return rawToken;
 }
 
 function recoverOrRotateApprovalToken(approval, actorId = 'SYSTEM') {
   if (!approval || approval.decision !== 'PENDING') throw new AppError('Approval sudah tidak menunggu keputusan.');
-  if (approval.expires_at < nowIso()) throw new AppError('Approval sudah kedaluwarsa.');
   if (approval.token_ciphertext) {
     try {
       const rawToken = decryptSecret(approval.token_ciphertext);
@@ -608,7 +607,7 @@ app.get('/api/bootstrap', authMiddleware, (req, res) => {
   const accounts = db.prepare('SELECT * FROM accounts WHERE active=1 ORDER BY code').all().map(accountPublic);
   const openPeriod = getOpenPeriod();
   const approvalCount = hasPermission(req, 'approvals.view')
-    ? db.prepare("SELECT COUNT(*) AS total FROM approval_requests WHERE decision='PENDING' AND expires_at>=?").get(nowIso()).total
+    ? db.prepare("SELECT COUNT(*) AS total FROM approval_requests WHERE decision='PENDING'").get().total
     : 0;
   res.json({
     user: publicUser(req.auth.user),
@@ -746,8 +745,6 @@ function approvalEntityDetail(approval) {
     approvalId: approval.id,
     entityType: approval.entity_type,
     entityId: approval.entity_id,
-    expiresAt: approval.expires_at,
-    expired: approval.expires_at < nowIso(),
     decision: approval.decision,
     decisionAt: approval.decision_at || '',
     note: approval.note || ''
@@ -836,10 +833,6 @@ function processApproval(approvalId, approverId, decision, note) {
     const approval = db.prepare('SELECT * FROM approval_requests WHERE id=?').get(approvalId);
     if (!approval) throw new AppError('Approval tidak ditemukan.', 404);
     if (approval.decision !== 'PENDING') throw new AppError('Approval sudah diproses.');
-    if (approval.expires_at < nowIso()) {
-      db.prepare("UPDATE approval_requests SET decision='EXPIRED',decision_at=?,note='Token kedaluwarsa' WHERE id=?").run(nowIso(), approval.id);
-      throw new AppError('Approval sudah kedaluwarsa.');
-    }
     const now = nowIso();
     let referenceNo = '';
     if (approval.entity_type === 'TRANSACTION') {
@@ -914,8 +907,8 @@ function validateDecision(body) {
 }
 
 function pendingApprovals() {
-  return db.prepare("SELECT * FROM approval_requests WHERE decision='PENDING' AND expires_at>=? ORDER BY expires_at ASC")
-    .all(nowIso()).map(approvalEntityDetail).filter(Boolean);
+  return db.prepare("SELECT * FROM approval_requests WHERE decision='PENDING' ORDER BY created_at ASC")
+    .all().map(approvalEntityDetail).filter(Boolean);
 }
 
 const approvalPinLimiter = rateLimit({
@@ -1936,7 +1929,7 @@ app.post('/api/admin/settings/logo', authMiddleware, requirePermission('settings
 
 app.patch('/api/admin/settings', authMiddleware, requirePermission('settings.manage'), (req, res, next) => {
   try {
-    const allowed = new Set(['APP_NAME', 'COMPANY_NAME', 'OPENING_BALANCE', 'SESSION_HOURS', 'APPROVAL_TOKEN_HOURS', 'MAX_UPLOAD_MB', 'UMO_APPROVAL_LIMIT', 'UMO_DUE_DAYS', 'THEME_COLOR']);
+    const allowed = new Set(['APP_NAME', 'COMPANY_NAME', 'OPENING_BALANCE', 'SESSION_HOURS', 'MAX_UPLOAD_MB', 'UMO_APPROVAL_LIMIT', 'UMO_DUE_DAYS', 'THEME_COLOR']);
     for (const [key, value] of Object.entries(req.body || {})) {
       if (!allowed.has(key)) continue;
       if (key === 'THEME_COLOR' && !/^#[0-9a-f]{6}$/i.test(String(value || ''))) throw new AppError('Warna tema tidak valid.');

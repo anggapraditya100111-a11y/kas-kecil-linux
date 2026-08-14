@@ -360,7 +360,6 @@ function initDatabase() {
     ['TIMEZONE', 'Asia/Jakarta', 'TEXT', 'Zona waktu'],
     ['OPENING_BALANCE', '0', 'NUMBER', 'Saldo awal'],
     ['SESSION_HOURS', '8', 'NUMBER', 'Durasi sesi'],
-    ['APPROVAL_TOKEN_HOURS', '24', 'NUMBER', 'Durasi token approval'],
     ['UMO_APPROVAL_LIMIT', '500000', 'NUMBER', 'Limit auto-approve Uang Muka Operasional'],
     ['UMO_DUE_DAYS', '3', 'NUMBER', 'Batas pertanggungjawaban UMO dalam hari'],
     ['THEME_COLOR', '#1d4ed8', 'TEXT', 'Warna utama aplikasi'],
@@ -378,6 +377,19 @@ function initDatabase() {
     SELECT id,'TRANSACTION',transaction_id,token_hash,expires_at,decision,decision_by,decision_at,note,attempt_count,
       COALESCE(decision_at, expires_at)
     FROM approvals;
+
+    UPDATE approval_requests
+    SET decision='PENDING',decision_by=NULL,decision_at=NULL,
+      note=CASE WHEN decision='EXPIRED' THEN '' ELSE note END,
+      expires_at='9999-12-31T23:59:59.999Z'
+    WHERE decision='PENDING'
+       OR (decision='EXPIRED' AND (
+         (entity_type='TRANSACTION' AND EXISTS(SELECT 1 FROM transactions WHERE id=entity_id AND status='PENDING'))
+         OR (entity_type='TRANSFER' AND EXISTS(SELECT 1 FROM cash_transfers WHERE id=entity_id AND status='PENDING'))
+         OR (entity_type='UMO_ISSUE' AND EXISTS(SELECT 1 FROM operational_advances WHERE id=entity_id AND status='PENDING'))
+         OR (entity_type='UMO_SETTLEMENT' AND EXISTS(SELECT 1 FROM operational_advances WHERE id=entity_id AND status='SETTLEMENT_PENDING'))
+         OR (entity_type='CORRECTION' AND EXISTS(SELECT 1 FROM transaction_corrections WHERE id=entity_id AND status='PENDING'))
+       ));
 
     INSERT OR IGNORE INTO ledger_entries(id,user_id,entry_date,direction,amount,source_type,source_id,reference_no,description,account_id,created_by,created_at)
     SELECT 'LED-' || lower(hex(randomblob(16))),created_by,transaction_date,

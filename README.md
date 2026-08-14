@@ -2,6 +2,11 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.5.2
+
+- Tautan approval tidak memiliki masa kedaluwarsa; keputusan tetap memerlukan PIN approver dan hanya dapat dilakukan selama pengajuan berstatus menunggu.
+- Pengaturan durasi token approval dihapus karena tidak lagi digunakan.
+
 ## Perbaikan versi 1.5.1
 
 - Restore `.kkbackup` mendukung volume database dan upload yang terpasang terpisah di Docker.
@@ -10,7 +15,7 @@ Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux 
 ## Fitur utama
 
 - Pencatatan kas masuk dan kas keluar dengan bukti transaksi.
-- Approval melalui tautan publik dan PIN approver 8 digit tanpa login.
+- Approval melalui tautan publik tanpa masa kedaluwarsa dan PIN approver 8 digit tanpa login.
 - Hak akses granular untuk Staff, SPV, dan Super User.
 - Mutasi kas per pengguna seperti rekening koran.
 - Rekap total dana seluruh akun dengan filter tanggal/akun dan export Excel/PDF.
