@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kas-kecil:1.5.2
+    image: kas-kecil:1.5.3
     container_name: kas-kecil
     restart: unless-stopped
     ports:

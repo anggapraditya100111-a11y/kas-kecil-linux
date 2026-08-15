@@ -51,7 +51,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.2';
+const APP_VERSION = '1.5.3';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -263,6 +263,29 @@ function accountPublic(row) {
     underlyingRequired: Boolean(row.underlying_required),
     active: Boolean(row.active)
   };
+}
+
+function accountUsage(accountId) {
+  const transactions = Number(db.prepare('SELECT COUNT(*) AS total FROM transactions WHERE account_id=?').get(accountId).total);
+  const ledgerEntries = Number(db.prepare('SELECT COUNT(*) AS total FROM ledger_entries WHERE account_id=?').get(accountId).total);
+  const umoAllocations = Number(db.prepare('SELECT COUNT(*) AS total FROM umo_allocations WHERE account_id=?').get(accountId).total);
+  const corrections = Number(db.prepare('SELECT COUNT(*) AS total FROM transaction_corrections WHERE proposed_account_id=?').get(accountId).total);
+  const budgetAllocations = Number(db.prepare('SELECT COUNT(*) AS total FROM cash_budget_allocations WHERE account_id=?').get(accountId).total);
+  const financialReferences = transactions + ledgerEntries + umoAllocations + corrections;
+  return {
+    transactions,
+    ledgerEntries,
+    umoAllocations,
+    corrections,
+    budgetAllocations,
+    financialReferences,
+    totalReferences: financialReferences + budgetAllocations
+  };
+}
+
+function accountAdminPublic(row) {
+  const usage = accountUsage(row.id);
+  return { ...accountPublic(row), canDelete: usage.totalReferences === 0 };
 }
 
 function transactionPublic(row) {
@@ -1866,7 +1889,7 @@ app.get('/api/accounts', authMiddleware, requirePermission('accounts.view'), (_r
 });
 
 app.get('/api/admin/accounts', authMiddleware, requirePermission('accounts.manage'), (_req, res) => {
-  res.json({ accounts: db.prepare('SELECT * FROM accounts ORDER BY code').all().map(accountPublic) });
+  res.json({ accounts: db.prepare('SELECT * FROM accounts ORDER BY code').all().map(accountAdminPublic) });
 });
 
 app.post('/api/admin/accounts', authMiddleware, requirePermission('accounts.manage'), (req, res, next) => {
@@ -1906,6 +1929,32 @@ app.patch('/api/admin/accounts/:accountId', authMiddleware, requirePermission('a
     audit(req.auth.user.id, 'UPDATE', 'ACCOUNT', target.id, accountPublic(target), { code, name, scope, limit, required, underlyingRequired, active }, 'Akun kas diperbarui');
     res.json({ ok: true });
   } catch (error) { next(error); }
+});
+
+app.delete('/api/admin/accounts/:accountId', authMiddleware, requirePermission('accounts.manage'), (req, res, next) => {
+  try {
+    const remove = db.transaction(() => {
+      const target = db.prepare('SELECT * FROM accounts WHERE id=?').get(req.params.accountId);
+      if (!target) throw new AppError('Akun tidak ditemukan.', 404);
+      const usage = accountUsage(target.id);
+      if (usage.financialReferences > 0) {
+        throw new AppError('Akun sudah memiliki transaksi atau riwayat pembukuan dan tidak dapat dihapus. Silakan nonaktifkan akun.', 409);
+      }
+      if (usage.budgetAllocations > 0) {
+        throw new AppError('Akun sudah digunakan pada Pagu Kas dan tidak dapat dihapus. Silakan nonaktifkan akun.', 409);
+      }
+      db.prepare('DELETE FROM accounts WHERE id=?').run(target.id);
+      audit(req.auth.user.id, 'DELETE', 'ACCOUNT', target.id, accountPublic(target), '', 'Akun kas yang belum digunakan dihapus');
+      return target;
+    });
+    const deleted = remove();
+    res.json({ ok: true, accountId: deleted.id });
+  } catch (error) {
+    if (String(error.message).includes('FOREIGN KEY')) {
+      return next(new AppError('Akun sudah digunakan dan tidak dapat dihapus. Silakan nonaktifkan akun.', 409));
+    }
+    next(error);
+  }
 });
 
 app.get('/api/admin/settings', authMiddleware, requirePermission('settings.manage'), (_req, res) => {

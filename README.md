@@ -2,6 +2,11 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.5.3
+
+- Akun kas yang belum pernah digunakan dapat dihapus dari kolom Aksi.
+- Akun yang sudah memiliki riwayat transaksi, pembukuan, UMO, koreksi, atau pagu hanya dapat dinonaktifkan.
+
 ## Perbaikan versi 1.5.2
 
 - Tautan approval tidak memiliki masa kedaluwarsa; keputusan tetap memerlukan PIN approver dan hanya dapat dilakukan selama pengajuan berstatus menunggu.

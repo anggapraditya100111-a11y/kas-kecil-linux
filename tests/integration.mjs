@@ -90,11 +90,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.5.2');
+  assert.equal(health.version, '1.5.3');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.5.2', '/styles.css?v=1.5.2']) {
+  for (const asset of ['/app.js?v=1.5.3', '/styles.css?v=1.5.3']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -123,6 +123,15 @@ async function main() {
     cookie: admin, method: 'POST', expected: 201,
     body: { accountCode: 'TOPUP', accountName: 'Pengisian Kas', transactionScope: 'MASUK', approvalLimit: 0, receiptRequired: false }
   });
+  const disposable = await request('/api/admin/accounts', {
+    cookie: admin, method: 'POST', expected: 201,
+    body: { accountCode: 'TEMP', accountName: 'Akun Salah Input', transactionScope: 'KELUAR', approvalLimit: 0, receiptRequired: false }
+  });
+  let adminAccounts = await request('/api/admin/accounts', { cookie: admin });
+  assert.equal(adminAccounts.accounts.find(account => account.accountId === disposable.accountId).canDelete, true);
+  await request(`/api/admin/accounts/${disposable.accountId}`, { cookie: admin, method: 'DELETE' });
+  adminAccounts = await request('/api/admin/accounts', { cookie: admin });
+  assert.equal(adminAccounts.accounts.some(account => account.accountId === disposable.accountId), false);
 
   const staffAResult = await request('/api/admin/users', {
     cookie: admin, method: 'POST', expected: 201,
@@ -189,6 +198,9 @@ async function main() {
   cashOut.set('underlyingDocument', new Blob([Buffer.from('%PDF-1.4\nunderlying\n%%EOF')], { type: 'application/pdf' }), 'surat-permintaan.pdf');
   const outResult = await request('/api/transactions', { cookie: staffA, method: 'POST', form: cashOut, expected: 201 });
   assert.equal(outResult.status, 'PENDING');
+  await request(`/api/admin/accounts/${outgoing.accountId}`, { cookie: admin, method: 'DELETE', expected: 409 });
+  adminAccounts = await request('/api/admin/accounts', { cookie: admin });
+  assert.equal(adminAccounts.accounts.find(account => account.accountId === outgoing.accountId).canDelete, false);
   integrationDb.prepare("UPDATE approval_requests SET expires_at='2000-01-01T00:00:00.000Z' WHERE entity_type='TRANSACTION' AND entity_id=?")
     .run(outResult.transactionId);
   const pendingApprovals = await request('/api/approvals', { cookie: admin });
@@ -329,11 +341,11 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.5.2', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.5.3', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,
-    monthlyBudget: true, monthlyPeriodLock: true, fullEncryptedBackup: true, protectedDatabaseReset: true, historicalBackup: true
+    monthlyBudget: true, monthlyPeriodLock: true, accountDeletionGuard: true, fullEncryptedBackup: true, protectedDatabaseReset: true, historicalBackup: true
   }, null, 2));
 }
 

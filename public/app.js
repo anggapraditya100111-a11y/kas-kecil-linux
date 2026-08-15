@@ -831,13 +831,14 @@ async function renderAccounts() {
     <div class="card"><h3>Daftar akun</h3>${accountTable(data.accounts)}</div></div>`;
   document.getElementById('account-form').addEventListener('submit', createAccount);
   document.querySelectorAll('[data-account-active]').forEach(button => button.addEventListener('click', () => updateAccount(button.dataset.accountActive, { active: button.dataset.nextActive === 'true' })));
+  document.querySelectorAll('[data-account-delete]').forEach(button => button.addEventListener('click', () => deleteAccount(button.dataset.accountDelete, button.dataset.accountName)));
   document.querySelectorAll('[data-account-receipt]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountReceipt, { receiptRequired: input.checked })));
   document.querySelectorAll('[data-account-underlying]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountUnderlying, { underlyingRequired: input.checked })));
 }
 
 function accountTable(accounts) {
   if (!accounts.length) return empty('Belum ada akun kas.');
-  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Bukti wajib</th><th>Underlying wajib</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.transactionScope)}</td><td class="amount">${money(account.approvalLimit)}</td><td><input data-account-receipt="${escapeHtml(account.accountId)}" type="checkbox" ${account.receiptRequired ? 'checked' : ''}></td><td><input data-account-underlying="${escapeHtml(account.accountId)}" type="checkbox" ${account.underlyingRequired ? 'checked' : ''}></td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Bukti wajib</th><th>Underlying wajib</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.transactionScope)}</td><td class="amount">${money(account.approvalLimit)}</td><td><input data-account-receipt="${escapeHtml(account.accountId)}" type="checkbox" ${account.receiptRequired ? 'checked' : ''}></td><td><input data-account-underlying="${escapeHtml(account.accountId)}" type="checkbox" ${account.underlyingRequired ? 'checked' : ''}></td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><div class="actions"><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button><button class="btn btn-danger btn-sm" data-account-delete="${escapeHtml(account.accountId)}" data-account-name="${escapeHtml(account.accountName)}" ${account.canDelete ? '' : 'disabled title="Akun sudah digunakan dan hanya dapat dinonaktifkan"'}>Hapus</button></div></td></tr>`).join('')}</tbody></table></div>`;
 }
 
 async function createAccount(event) {
@@ -852,6 +853,15 @@ async function updateAccount(accountId, patch) {
   setLoading(true);
   try { await api(`/api/admin/accounts/${encodeURIComponent(accountId)}`, { method: 'PATCH', body: patch }); toast('Akun kas diperbarui.'); await bootstrap(); await renderAccounts(); }
   catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+async function deleteAccount(accountId, accountName) {
+  if (!window.confirm(`Hapus akun "${accountName}" secara permanen?`)) return;
+  setLoading(true);
+  try {
+    await api(`/api/admin/accounts/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+    toast('Akun kas berhasil dihapus.'); await bootstrap(); await renderAccounts();
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
 }
 
 async function renderSettings() {

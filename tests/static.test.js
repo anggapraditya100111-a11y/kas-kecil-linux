@@ -155,8 +155,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.5\.2/);
-  assert.match(html, /app\.js\?v=1\.5\.2/);
+  assert.match(html, /styles\.css\?v=1\.5\.3/);
+  assert.match(html, /app\.js\?v=1\.5\.3/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
@@ -207,4 +207,13 @@ test('tautan approval tidak memiliki masa kedaluwarsa', () => {
   assert.match(server, /WHERE decision='PENDING' ORDER BY created_at ASC/);
   assert.doesNotMatch(server, /Approval sudah kedaluwarsa/);
   assert.doesNotMatch(client, /Durasi token approval|setting-approval|Tautan approval sudah kedaluwarsa/);
+});
+
+test('akun kas hanya dapat dihapus sebelum digunakan', () => {
+  assert.match(client, /data-account-delete/);
+  assert.match(client, /function deleteAccount/);
+  assert.match(server, /app\.delete\('\/api\/admin\/accounts\/:accountId'/);
+  assert.match(server, /accountUsage/);
+  assert.match(server, /Silakan nonaktifkan akun/);
+  assert.match(server, /DELETE FROM accounts WHERE id=\?/);
 });

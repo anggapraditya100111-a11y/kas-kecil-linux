@@ -1,6 +1,6 @@
 {
   "name": "kas-kecil",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "private": true,
   "description": "Aplikasi kas kecil berbasis web untuk Linux dan CasaOS",
   "main": "src/server.js",
