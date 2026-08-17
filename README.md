@@ -2,6 +2,11 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.5.4
+
+- Tombol **Edit** tersedia pada kolom Aksi di menu Super User → Akun Kas untuk mengubah kode, nama, cakupan, limit auto-approval, kewajiban bukti, dan underlying document.
+- Daftar akun aktif maupun nonaktif dapat diekspor ke Excel, termasuk status dan jumlah referensi transaksi/pembukuan; aktivitas ekspor tercatat di audit log.
+
 ## Perbaikan versi 1.5.3
 
 - Akun kas yang belum pernah digunakan dapat dihapus dari kolom Aksi.

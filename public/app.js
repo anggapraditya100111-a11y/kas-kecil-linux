@@ -826,19 +826,56 @@ async function saveAccess(event, userId) {
 async function renderAccounts() {
   const data = await api('/api/admin/accounts');
   document.getElementById('page').innerHTML = `
-    <div class="page-head"><div><h2>Akun Kas</h2><p>Atur kategori transaksi dan batas auto-approve.</p></div></div>
+    <div class="page-head"><div><h2>Akun Kas</h2><p>Atur kategori transaksi dan batas auto-approve.</p></div><div class="actions"><button id="account-export-xlsx" class="btn btn-ghost">Export Excel</button></div></div>
     <div class="section-grid"><div class="card"><h3>Tambah akun</h3><form id="account-form"><div class="grid-2"><div class="field"><label>Kode</label><input id="account-code" required></div><div class="field"><label>Nama akun</label><input id="account-name" required></div></div><div class="field"><label>Cakupan</label><select id="account-scope"><option value="KELUAR">Kas Keluar</option><option value="MASUK">Kas Masuk</option><option value="BOTH">Keduanya</option></select></div><div class="field"><label>Limit auto-approve</label><input id="account-limit" class="money-input" type="text" inputmode="numeric" value="0"></div><div class="field check"><input id="account-receipt" type="checkbox" checked><label for="account-receipt">Bukti transaksi wajib</label></div><div class="field check"><input id="account-underlying" type="checkbox"><label for="account-underlying">Underlying document wajib</label></div><button class="btn btn-primary" type="submit">Simpan akun</button></form></div>
     <div class="card"><h3>Daftar akun</h3>${accountTable(data.accounts)}</div></div>`;
   document.getElementById('account-form').addEventListener('submit', createAccount);
+  document.getElementById('account-export-xlsx').addEventListener('click', exportAccounts);
+  const accountById = new Map(data.accounts.map(account => [account.accountId, account]));
+  document.querySelectorAll('[data-account-edit]').forEach(button => button.addEventListener('click', () => editAccount(accountById.get(button.dataset.accountEdit))));
   document.querySelectorAll('[data-account-active]').forEach(button => button.addEventListener('click', () => updateAccount(button.dataset.accountActive, { active: button.dataset.nextActive === 'true' })));
   document.querySelectorAll('[data-account-delete]').forEach(button => button.addEventListener('click', () => deleteAccount(button.dataset.accountDelete, button.dataset.accountName)));
-  document.querySelectorAll('[data-account-receipt]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountReceipt, { receiptRequired: input.checked })));
-  document.querySelectorAll('[data-account-underlying]').forEach(input => input.addEventListener('change', () => updateAccount(input.dataset.accountUnderlying, { underlyingRequired: input.checked })));
 }
 
 function accountTable(accounts) {
   if (!accounts.length) return empty('Belum ada akun kas.');
-  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Bukti wajib</th><th>Underlying wajib</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td>${escapeHtml(account.accountCode)}</td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(account.transactionScope)}</td><td class="amount">${money(account.approvalLimit)}</td><td><input data-account-receipt="${escapeHtml(account.accountId)}" type="checkbox" ${account.receiptRequired ? 'checked' : ''}></td><td><input data-account-underlying="${escapeHtml(account.accountId)}" type="checkbox" ${account.underlyingRequired ? 'checked' : ''}></td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><div class="actions"><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button><button class="btn btn-danger btn-sm" data-account-delete="${escapeHtml(account.accountId)}" data-account-name="${escapeHtml(account.accountName)}" ${account.canDelete ? '' : 'disabled title="Akun sudah digunakan dan hanya dapat dinonaktifkan"'}>Hapus</button></div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Kode</th><th>Nama</th><th>Cakupan</th><th>Limit</th><th>Bukti</th><th>Underlying</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${accounts.map(account => `<tr><td><strong>${escapeHtml(account.accountCode)}</strong></td><td>${escapeHtml(account.accountName)}</td><td>${escapeHtml(typeLabel(account.transactionScope))}</td><td class="amount">${money(account.approvalLimit)}</td><td>${account.receiptRequired ? 'Wajib' : 'Opsional'}</td><td>${account.underlyingRequired ? 'Wajib' : 'Opsional'}</td><td>${statusHtml(account.active ? 'ACTIVE' : 'INACTIVE')}</td><td><div class="actions"><button class="btn btn-sm" data-account-edit="${escapeHtml(account.accountId)}">Edit</button><button class="btn btn-sm" data-account-active="${escapeHtml(account.accountId)}" data-next-active="${!account.active}">${account.active ? 'Nonaktifkan' : 'Aktifkan'}</button><button class="btn btn-danger btn-sm" data-account-delete="${escapeHtml(account.accountId)}" data-account-name="${escapeHtml(account.accountName)}" ${account.canDelete ? '' : 'disabled title="Akun sudah digunakan dan hanya dapat dinonaktifkan"'}>Hapus</button></div></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function editAccount(account) {
+  if (!account) return toast('Data akun tidak ditemukan.', true);
+  openModal(`<h2>Edit Akun Kas</h2><p class="muted">Perubahan tidak menghapus atau memindahkan riwayat transaksi akun.</p>
+    <form id="account-edit-form"><div class="grid-2"><div class="field"><label for="account-edit-code">Kode</label><input id="account-edit-code" value="${escapeHtml(account.accountCode)}" required></div><div class="field"><label for="account-edit-name">Nama akun</label><input id="account-edit-name" value="${escapeHtml(account.accountName)}" required></div></div>
+    <div class="field"><label for="account-edit-scope">Cakupan</label><select id="account-edit-scope"><option value="KELUAR" ${account.transactionScope === 'KELUAR' ? 'selected' : ''}>Kas Keluar</option><option value="MASUK" ${account.transactionScope === 'MASUK' ? 'selected' : ''}>Kas Masuk</option><option value="BOTH" ${account.transactionScope === 'BOTH' ? 'selected' : ''}>Kas Masuk & Keluar</option></select></div>
+    <div class="field"><label for="account-edit-limit">Limit auto-approve</label><input id="account-edit-limit" class="money-input" type="text" inputmode="numeric" value="${escapeHtml(formatMoneyInput(account.approvalLimit))}"></div>
+    <div class="field check"><input id="account-edit-receipt" type="checkbox" ${account.receiptRequired ? 'checked' : ''}><label for="account-edit-receipt">Bukti transaksi wajib</label></div>
+    <div class="field check"><input id="account-edit-underlying" type="checkbox" ${account.underlyingRequired ? 'checked' : ''}><label for="account-edit-underlying">Underlying document wajib</label></div>
+    <div class="actions"><button class="btn btn-primary" type="submit">Simpan perubahan</button><button id="account-edit-cancel" class="btn btn-ghost" type="button">Batal</button></div></form>`);
+  document.getElementById('account-edit-form').addEventListener('submit', event => saveAccountEdit(event, account.accountId));
+  document.getElementById('account-edit-cancel').addEventListener('click', closeModal);
+}
+
+async function saveAccountEdit(event, accountId) {
+  event.preventDefault(); setLoading(true);
+  try {
+    await api(`/api/admin/accounts/${encodeURIComponent(accountId)}`, { method: 'PATCH', body: {
+      accountCode: value('account-edit-code'), accountName: value('account-edit-name'),
+      transactionScope: value('account-edit-scope'), approvalLimit: parseMoney(value('account-edit-limit')),
+      receiptRequired: document.getElementById('account-edit-receipt').checked,
+      underlyingRequired: document.getElementById('account-edit-underlying').checked
+    } });
+    closeModal(); toast('Akun kas berhasil diperbarui.'); await bootstrap(); await renderAccounts();
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+async function exportAccounts() {
+  setLoading(true);
+  try {
+    const result = await apiBlob('/api/admin/accounts.xlsx');
+    const match = result.disposition.match(/filename="?([^";]+)"?/i);
+    downloadBlob(result.blob, match ? match[1] : 'Daftar_Akun_Kas.xlsx');
+    toast('Daftar akun kas berhasil diekspor ke Excel.');
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
 }
 
 async function createAccount(event) {

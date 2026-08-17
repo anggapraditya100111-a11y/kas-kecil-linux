@@ -51,7 +51,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.3';
+const APP_VERSION = '1.5.4';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -1892,6 +1892,55 @@ app.get('/api/admin/accounts', authMiddleware, requirePermission('accounts.manag
   res.json({ accounts: db.prepare('SELECT * FROM accounts ORDER BY code').all().map(accountAdminPublic) });
 });
 
+app.get('/api/admin/accounts.xlsx', authMiddleware, requirePermission('accounts.manage'), asyncRoute(async (req, res) => {
+  const rows = db.prepare('SELECT * FROM accounts ORDER BY code').all().map(row => ({
+    ...accountAdminPublic(row),
+    usage: accountUsage(row.id)
+  }));
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = getSetting('COMPANY_NAME', DEFAULT_COMPANY_NAME);
+  workbook.created = new Date();
+  const sheet = workbook.addWorksheet('Daftar Akun Kas', { views: [{ state: 'frozen', ySplit: 1 }] });
+  sheet.columns = [
+    { header: 'Kode', key: 'accountCode', width: 15 },
+    { header: 'Nama Akun', key: 'accountName', width: 32 },
+    { header: 'Cakupan Transaksi', key: 'transactionScope', width: 20 },
+    { header: 'Limit Auto-Approval', key: 'approvalLimit', width: 22 },
+    { header: 'Bukti Transaksi', key: 'receiptRequirement', width: 19 },
+    { header: 'Underlying Document', key: 'underlyingRequirement', width: 22 },
+    { header: 'Status', key: 'accountStatus', width: 14 },
+    { header: 'Jumlah Transaksi', key: 'transactions', width: 18 },
+    { header: 'Mutasi Pembukuan', key: 'ledgerEntries', width: 18 },
+    { header: 'Alokasi UMO', key: 'umoAllocations', width: 15 },
+    { header: 'Koreksi', key: 'corrections', width: 12 },
+    { header: 'Pagu Kas', key: 'budgetAllocations', width: 12 },
+    { header: 'Dapat Dihapus', key: 'deletable', width: 16 }
+  ];
+  rows.forEach(row => sheet.addRow({
+    ...row,
+    transactionScope: ({ MASUK: 'Kas Masuk', KELUAR: 'Kas Keluar', BOTH: 'Kas Masuk & Keluar' })[row.transactionScope] || row.transactionScope,
+    receiptRequirement: row.receiptRequired ? 'Wajib' : 'Opsional',
+    underlyingRequirement: row.underlyingRequired ? 'Wajib' : 'Opsional',
+    accountStatus: row.active ? 'Aktif' : 'Nonaktif',
+    transactions: row.usage.transactions,
+    ledgerEntries: row.usage.ledgerEntries,
+    umoAllocations: row.usage.umoAllocations,
+    corrections: row.usage.corrections,
+    budgetAllocations: row.usage.budgetAllocations,
+    deletable: row.canDelete ? 'Ya' : 'Tidak'
+  }));
+  sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2747' } };
+  sheet.getRow(1).alignment = { vertical: 'middle', horizontal: 'center' };
+  sheet.getColumn('approvalLimit').numFmt = 'Rp #,##0;[Red]-Rp #,##0';
+  sheet.autoFilter = { from: 'A1', to: `M${Math.max(sheet.rowCount, 1)}` };
+  audit(req.auth.user.id, 'EXPORT_ACCOUNTS_XLSX', 'ACCOUNT', 'ALL', '', { count: rows.length, format: 'xlsx' }, 'Daftar akun kas diekspor ke Excel');
+  res.attachment(`Daftar_Akun_Kas_${localToday().replace(/-/g, '')}.xlsx`);
+  res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  await workbook.xlsx.write(res);
+  res.end();
+}));
+
 app.post('/api/admin/accounts', authMiddleware, requirePermission('accounts.manage'), (req, res, next) => {
   try {
     const code = cleanText(req.body.accountCode, 30).toUpperCase();
@@ -1928,7 +1977,10 @@ app.patch('/api/admin/accounts/:accountId', authMiddleware, requirePermission('a
       .run(code, name, scope, limit, required, underlyingRequired, active, req.auth.user.id, nowIso(), target.id);
     audit(req.auth.user.id, 'UPDATE', 'ACCOUNT', target.id, accountPublic(target), { code, name, scope, limit, required, underlyingRequired, active }, 'Akun kas diperbarui');
     res.json({ ok: true });
-  } catch (error) { next(error); }
+  } catch (error) {
+    if (String(error.message).includes('UNIQUE')) return next(new AppError('Kode akun sudah digunakan.'));
+    next(error);
+  }
 });
 
 app.delete('/api/admin/accounts/:accountId', authMiddleware, requirePermission('accounts.manage'), (req, res, next) => {

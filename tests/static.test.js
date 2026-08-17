@@ -155,8 +155,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.5\.3/);
-  assert.match(html, /app\.js\?v=1\.5\.3/);
+  assert.match(html, /styles\.css\?v=1\.5\.4/);
+  assert.match(html, /app\.js\?v=1\.5\.4/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
@@ -216,4 +216,15 @@ test('akun kas hanya dapat dihapus sebelum digunakan', () => {
   assert.match(server, /accountUsage/);
   assert.match(server, /Silakan nonaktifkan akun/);
   assert.match(server, /DELETE FROM accounts WHERE id=\?/);
+});
+
+test('akun kas dapat diedit dan diekspor ke Excel oleh Super User', () => {
+  assert.match(client, /data-account-edit/);
+  assert.match(client, /function editAccount/);
+  assert.match(client, /function saveAccountEdit/);
+  assert.match(client, /function exportAccounts/);
+  assert.match(client, /api\/admin\/accounts\.xlsx/);
+  assert.match(server, /app\.get\('\/api\/admin\/accounts\.xlsx'/);
+  assert.match(server, /requirePermission\('accounts\.manage'\)/);
+  assert.match(server, /EXPORT_ACCOUNTS_XLSX/);
 });

@@ -1,6 +1,6 @@
 Kas Kecil untuk CasaOS dan Linux
-Versi: 1.5.3
-Tanggal: 2026-08-15
+Versi: 1.5.4
+Tanggal: 2026-08-17
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
@@ -39,3 +39,5 @@ Fitur utama:
 
 - Tautan approval tidak memiliki masa kedaluwarsa dan tetap dilindungi PIN serta status pengajuan
 - Akun kas yang belum pernah digunakan dapat dihapus; akun bertransaksi hanya dapat dinonaktifkan
+- Akun kas dapat diedit melalui tombol Aksi tanpa mengubah relasi transaksi lama
+- Daftar akun aktif/nonaktif dapat diekspor ke Excel dan tercatat di audit log
