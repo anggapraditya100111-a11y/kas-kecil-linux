@@ -153,7 +153,7 @@ const createFunding = db.transaction(payload => {
 
   db.prepare(`INSERT INTO ledger_entries(
     id,user_id,entry_date,direction,amount,source_type,source_id,reference_no,description,account_id,created_by,created_at
-  ) VALUES(?,?,?,'IN',?,'TRANSACTION',?,?,?,?,?,?,?)`)
+  ) VALUES(?,?,?,'IN',?,'TRANSACTION',?,?,?,?,?,?)`)
     .run(
       newId('LED'), recipient.id, payload.transactionDate, payload.amount,
       transactionId, referenceNo, description, account.id, recipient.id, now
@@ -238,8 +238,10 @@ app.use((error, _req, res, _next) => {
   res.status(status).json({ ok: false, error: status >= 500 ? 'Terjadi kesalahan pada service integrasi.' : error.message });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Service integrasi Kas Kecil berjalan di port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Service integrasi Kas Kecil berjalan di port ${PORT}`);
+  });
+}
 
 module.exports = { app, createFunding, existingFunding };
