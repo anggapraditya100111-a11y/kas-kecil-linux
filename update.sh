@@ -29,11 +29,27 @@ fi
 
 git fetch origin "$current_branch"
 git pull --ff-only origin "$current_branch"
+
+if ! grep -q '^KAS_BESAR_INTEGRATION_KEY=' .env 2>/dev/null; then
+  if command -v openssl >/dev/null 2>&1; then
+    integration_key="$(openssl rand -hex 32)"
+  else
+    integration_key="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+  fi
+  printf '\nKAS_BESAR_INTEGRATION_KEY=%s\n' "$integration_key" >> .env
+  chmod 600 .env
+  echo "Kas Besar integration key dibuat: $integration_key"
+  echo "Simpan key ini untuk konfigurasi AINET Kas Besar."
+fi
+
+docker network inspect ainet-finance >/dev/null 2>&1 || docker network create ainet-finance >/dev/null
+
 docker compose up -d --build --force-recreate
 
 app_port="$(sed -n 's/^APP_PORT=//p' .env 2>/dev/null | tail -n 1)"
 app_port="${app_port:-8090}"
 echo "Update selesai. Aplikasi aktif di http://IP-SERVER:$app_port"
+echo "Service integrasi Kas Besar aktif pada network internal ainet-finance."
 echo "Versi aktif:"
 curl --fail --silent "http://127.0.0.1:$app_port/api/health" || true
 echo
