@@ -10,7 +10,10 @@ const state = {
   loadingCount: 0,
   userOptions: [],
   budget: null,
-  openPeriod: null
+  openPeriod: null,
+  umoCanManage: false,
+  pendingCorrectionTransactionId: '',
+  pendingCorrectionReason: ''
 };
 
 const pages = [
@@ -636,7 +639,7 @@ async function submitTransfer(event) {
 }
 
 async function renderUmo() {
-  const data = await api('/api/umo'); state.umoRows = data.rows || [];
+  const data = await api('/api/umo'); state.umoRows = data.rows || []; state.umoCanManage = Boolean(data.canManage);
   const defaultDue = datePlusDays(Number(data.dueDays || 3));
   const form = has('umo.create') ? `<div class="card"><h3>Buat Uang Muka Operasional</h3><p class="muted">Saldo Anda ${money(data.balance)}. UMO di atas ${money(data.approvalLimit)} memerlukan approval.</p><form id="umo-form"><div class="grid-4"><div class="field"><label>Tanggal</label><input id="umo-date" type="date" value="${todayInput()}" required></div><div class="field"><label>Batas pertanggungjawaban</label><input id="umo-due" type="date" value="${defaultDue}" required></div><div class="field"><label>Pembawa/penerima uang</label><input id="umo-bearer" maxlength="120" required></div><div class="field"><label>Nominal UMO</label><input id="umo-amount" class="money-input" type="text" inputmode="numeric" autocomplete="off" placeholder="0" required></div></div><div class="field"><label>Keperluan sementara</label><textarea id="umo-purpose" maxlength="500" required></textarea></div><div id="umo-result"></div><button class="btn btn-primary" type="submit">Catat UMO</button></form></div>` : '';
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Uang Muka Operasional (UMO)</h2><p>Pengeluaran sementara yang belum diketahui akun dan realisasi akhirnya.</p></div></div>${form}<div class="card"><h3>Daftar UMO</h3>${umoTable(data.rows || [])}</div>`;
@@ -644,12 +647,66 @@ async function renderUmo() {
   document.querySelectorAll('[data-umo-settle]').forEach(button => button.addEventListener('click', () => openUmoSettlement(button.dataset.umoSettle)));
   document.querySelectorAll('[data-umo-receipt]').forEach(button => button.addEventListener('click', () => window.open(`/api/umo/${encodeURIComponent(button.dataset.umoReceipt)}/receipt`, '_blank', 'noopener')));
   document.querySelectorAll('[data-umo-pdf]').forEach(button => button.addEventListener('click', () => window.open(`/api/umo/${encodeURIComponent(button.dataset.umoPdf)}/disbursement-receipt.pdf`, '_blank', 'noopener')));
+  document.querySelectorAll('[data-umo-edit]').forEach(button => button.addEventListener('click', () => openUmoCorrection(button.dataset.umoEdit)));
+  document.querySelectorAll('[data-umo-delete]').forEach(button => button.addEventListener('click', () => openUmoDelete(button.dataset.umoDelete)));
+  document.querySelectorAll('[data-umo-correct-realization]').forEach(button => button.addEventListener('click', () => openUmoRealizationCorrection(button.dataset.umoCorrectRealization)));
   bindApprovalLinkButtons();
 }
 
 function umoTable(rows) {
   if (!rows.length) return empty('Belum ada UMO.');
-  return `<div class="table-wrap"><table><thead><tr><th>No.</th><th>Staff/Pembawa</th><th>Keperluan</th><th>Jatuh tempo</th><th>UMO</th><th>Realisasi</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${rows.map(row => `<tr class="${row.overdue ? 'row-overdue' : ''}"><td>${escapeHtml(row.umoNo)}<br><span class="muted">${escapeHtml(row.advanceDate)}</span></td><td>${escapeHtml(row.userName)}<br><span class="muted">${escapeHtml(row.bearerName)}</span></td><td>${escapeHtml(row.purpose)}</td><td>${escapeHtml(row.dueDate)}${row.overdue ? '<br><span class="status status-rejected">TERLAMBAT</span>' : ''}</td><td class="amount">${money(row.advanceAmount)}</td><td class="amount">${row.settledAmount ? money(row.settledAmount) : '-'}</td><td>${statusHtml(row.status)}</td><td><div class="actions">${row.status === 'OPEN' && (row.userId === state.user.userId || has('umo.view_all')) ? `<button class="btn btn-primary btn-sm" data-umo-settle="${escapeHtml(row.umoId)}">Pertanggungjawabkan</button>` : ''}${row.receiptPdfAvailable ? `<button class="btn btn-sm" data-umo-pdf="${escapeHtml(row.umoId)}">PDF tanda terima</button>` : ''}${row.receiptAvailable ? `<button class="btn btn-sm" data-umo-receipt="${escapeHtml(row.umoId)}">Bukti</button>` : ''}${row.approvalId ? `<button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link approval</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>No.</th><th>Staff/Pembawa</th><th>Keperluan</th><th>Jatuh tempo</th><th>UMO</th><th>Realisasi</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${rows.map(row => `<tr class="${row.overdue ? 'row-overdue' : ''}"><td>${escapeHtml(row.umoNo)}<br><span class="muted">${escapeHtml(row.advanceDate)}</span></td><td>${escapeHtml(row.userName)}<br><span class="muted">${escapeHtml(row.bearerName)}</span></td><td>${escapeHtml(row.purpose)}</td><td>${escapeHtml(row.dueDate)}${row.overdue ? '<br><span class="status status-rejected">TERLAMBAT</span>' : ''}</td><td class="amount">${money(row.advanceAmount)}</td><td class="amount">${row.settledAmount ? money(row.settledAmount) : '-'}</td><td>${statusHtml(row.status)}</td><td><div class="actions">${row.status === 'OPEN' && (row.userId === state.user.userId || has('umo.view_all')) ? `<button class="btn btn-primary btn-sm" data-umo-settle="${escapeHtml(row.umoId)}">Pertanggungjawabkan</button>` : ''}${state.umoCanManage && row.canEdit ? `<button class="btn btn-sm" data-umo-edit="${escapeHtml(row.umoId)}">Koreksi</button>` : ''}${state.umoCanManage && row.canDelete ? `<button class="btn btn-danger btn-sm" data-umo-delete="${escapeHtml(row.umoId)}">Hapus</button>` : ''}${row.status === 'SETTLED' && (row.correctionTransactions || []).length && has('corrections.create') ? `<button class="btn btn-sm" data-umo-correct-realization="${escapeHtml(row.umoId)}">Koreksi realisasi</button>` : ''}${row.receiptPdfAvailable ? `<button class="btn btn-sm" data-umo-pdf="${escapeHtml(row.umoId)}">PDF tanda terima</button>` : ''}${row.receiptAvailable ? `<button class="btn btn-sm" data-umo-receipt="${escapeHtml(row.umoId)}">Bukti</button>` : ''}${row.approvalId ? `<button class="btn btn-sm" data-approval-link="${escapeHtml(row.approvalId)}">Salin link approval</button>` : ''}</div></td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function openUmoCorrection(umoId) {
+  const row = (state.umoRows || []).find(item => item.umoId === umoId); if (!row) return;
+  openModal(`<h2>Koreksi ${escapeHtml(row.umoNo)}</h2><div class="notice">Koreksi hanya mengubah UMO yang belum direalisasikan. Saldo dan mutasi pencairan akan disesuaikan otomatis.</div><form id="umo-correction-form"><div class="grid-2"><div class="field"><label>Tanggal UMO</label><input id="umo-correction-date" type="date" value="${escapeHtml(row.advanceDate)}" required></div><div class="field"><label>Jatuh tempo</label><input id="umo-correction-due" type="date" value="${escapeHtml(row.dueDate)}" required></div><div class="field"><label>Pembawa/penerima uang</label><input id="umo-correction-bearer" maxlength="120" value="${escapeHtml(row.bearerName)}" required></div><div class="field"><label>Nominal UMO</label><input id="umo-correction-amount" class="money-input" type="text" inputmode="numeric" value="${escapeHtml(formatMoneyInput(row.advanceAmount))}" required></div></div><div class="field"><label>Keperluan</label><textarea id="umo-correction-purpose" maxlength="500" required>${escapeHtml(row.purpose)}</textarea></div><div class="field"><label>Alasan koreksi</label><textarea id="umo-correction-reason" maxlength="500" required></textarea></div><div class="field"><label>Password Super User</label><input id="umo-correction-password" type="password" autocomplete="current-password" required></div><button class="btn btn-primary" type="submit">Backup & Simpan Koreksi</button></form>`);
+  document.getElementById('umo-correction-form').addEventListener('submit', event => submitUmoCorrection(event, umoId));
+}
+
+async function submitUmoCorrection(event, umoId) {
+  event.preventDefault(); setLoading(true);
+  try {
+    const result = await api(`/api/admin/umo/${encodeURIComponent(umoId)}`, { method: 'PATCH', body: {
+      advanceDate: value('umo-correction-date'), dueDate: value('umo-correction-due'), bearerName: value('umo-correction-bearer'),
+      advanceAmount: parseMoney(value('umo-correction-amount')), purpose: value('umo-correction-purpose'),
+      reason: value('umo-correction-reason'), currentPassword: value('umo-correction-password')
+    } });
+    closeModal(); toast(`UMO berhasil dikoreksi. Backup: ${result.backupFileName}`); await renderUmo();
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+function openUmoDelete(umoId) {
+  const row = (state.umoRows || []).find(item => item.umoId === umoId); if (!row) return;
+  openModal(`<h2>Hapus ${escapeHtml(row.umoNo)}</h2><div class="notice warn"><strong>Perhatian:</strong> UMO akan dihapus permanen bersama mutasi pencairannya. Database dibackup otomatis sebelum proses.</div><form id="umo-delete-form"><div class="field"><label>Alasan penghapusan</label><textarea id="umo-delete-reason" maxlength="500" required></textarea></div><div class="grid-2"><div class="field"><label>Password Super User</label><input id="umo-delete-password" type="password" autocomplete="current-password" required></div><div class="field"><label>Ketik HAPUS UMO</label><input id="umo-delete-confirmation" autocomplete="off" required></div></div><button class="btn btn-danger" type="submit">Backup & Hapus Permanen</button></form>`);
+  document.getElementById('umo-delete-form').addEventListener('submit', event => deleteUmo(event, umoId));
+}
+
+async function deleteUmo(event, umoId) {
+  event.preventDefault();
+  if (value('umo-delete-confirmation').toUpperCase() !== 'HAPUS UMO') return toast('Teks konfirmasi belum sesuai.', true);
+  if (!window.confirm('UMO dan mutasi pencairannya akan dihapus setelah backup dibuat. Lanjutkan?')) return;
+  setLoading(true);
+  try {
+    const result = await api(`/api/admin/umo/${encodeURIComponent(umoId)}`, { method: 'DELETE', body: {
+      reason: value('umo-delete-reason'), currentPassword: value('umo-delete-password'), confirmation: value('umo-delete-confirmation')
+    } });
+    closeModal(); toast(`${result.umoNo} dihapus. Backup: ${result.backupFileName}`); await renderUmo();
+  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+}
+
+function openUmoRealizationCorrection(umoId) {
+  const row = (state.umoRows || []).find(item => item.umoId === umoId); if (!row) return;
+  const transactions = row.correctionTransactions || [];
+  if (transactions.length === 1) return beginUmoTransactionCorrection(transactions[0].transactionId, row.umoNo);
+  openModal(`<h2>Koreksi realisasi ${escapeHtml(row.umoNo)}</h2><p class="muted">Pilih transaksi hasil pertanggungjawaban yang akan direversal atau diganti.</p><div class="actions correction-target-list">${transactions.map(tx => `<button class="btn btn-sm" data-umo-correction-target="${escapeHtml(tx.transactionId)}">${escapeHtml(tx.transactionNo)} — ${money(tx.amount)} — ${escapeHtml(tx.description)}</button>`).join('')}</div>`);
+  document.querySelectorAll('[data-umo-correction-target]').forEach(button => button.addEventListener('click', () => beginUmoTransactionCorrection(button.dataset.umoCorrectionTarget, row.umoNo)));
+}
+
+function beginUmoTransactionCorrection(transactionId, umoNo) {
+  state.pendingCorrectionTransactionId = transactionId;
+  state.pendingCorrectionReason = `Koreksi realisasi ${umoNo}`;
+  closeModal(); openPage('corrections');
 }
 
 async function submitUmo(event) {
@@ -688,7 +745,16 @@ async function renderCorrections() {
   const form = has('corrections.create') ? `<div class="card"><h3>Ajukan Koreksi</h3><form id="correction-form"><div class="grid-2"><div class="field"><label>Transaksi asal</label><select id="correction-original" required><option value="">Pilih transaksi...</option>${(data.transactions || []).map(tx => `<option value="${escapeHtml(tx.transactionId)}">${escapeHtml(tx.transactionNo)} — ${money(tx.amount)} — ${escapeHtml(tx.description)}</option>`).join('')}</select></div><div class="field"><label>Jenis koreksi</label><select id="correction-type"><option value="REVERSAL">Reversal/pembatalan penuh</option><option value="REPLACEMENT">Koreksi dan transaksi pengganti</option></select></div></div><div class="field"><label>Alasan koreksi</label><textarea id="correction-reason" required></textarea></div><div id="correction-replacement" class="hidden"><div class="grid-3"><div class="field"><label>Tanggal pengganti</label><input id="correction-date" type="date"></div><div class="field"><label>Jenis</label><select id="correction-tx-type"><option value="KELUAR">Kas Keluar</option><option value="MASUK">Kas Masuk</option></select></div><div class="field"><label>Akun</label><select id="correction-account">${state.accounts.map(account => `<option value="${escapeHtml(account.accountId)}">${escapeHtml(account.accountCode)} — ${escapeHtml(account.accountName)}</option>`).join('')}</select></div></div><div class="grid-2"><div class="field"><label>Nominal</label><input id="correction-amount" class="money-input" type="text" inputmode="numeric" autocomplete="off" placeholder="0"></div><div class="field"><label>Pihak terkait</label><input id="correction-counterparty"></div></div><div class="field"><label>Keterangan transaksi pengganti</label><textarea id="correction-description"></textarea></div>${receiptPicker('correction-receipt', 'Bukti pengganti (opsional)')}</div><div id="correction-result"></div><button class="btn btn-primary" type="submit">Ajukan koreksi</button></form></div>` : '';
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Koreksi Transaksi</h2><p>Transaksi approved tidak dihapus; sistem membuat reversal dan, bila perlu, transaksi pengganti.</p></div></div>${form}<div class="card"><h3>Riwayat Koreksi</h3>${correctionTable(data.rows || [])}</div>`;
   const formElement = document.getElementById('correction-form');
-  if (formElement) { document.getElementById('correction-type').addEventListener('change', updateCorrectionForm); document.getElementById('correction-original').addEventListener('change', prefillCorrection); formElement.addEventListener('submit', submitCorrection); bindReceiptPickers(formElement); }
+  if (formElement) {
+    document.getElementById('correction-type').addEventListener('change', updateCorrectionForm); document.getElementById('correction-original').addEventListener('change', prefillCorrection); formElement.addEventListener('submit', submitCorrection); bindReceiptPickers(formElement);
+    if (state.pendingCorrectionTransactionId && (data.transactions || []).some(tx => tx.transactionId === state.pendingCorrectionTransactionId)) {
+      document.getElementById('correction-original').value = state.pendingCorrectionTransactionId;
+      document.getElementById('correction-type').value = 'REPLACEMENT';
+      document.getElementById('correction-reason').value = state.pendingCorrectionReason;
+      updateCorrectionForm(); prefillCorrection();
+    }
+    state.pendingCorrectionTransactionId = ''; state.pendingCorrectionReason = '';
+  }
   bindApprovalLinkButtons();
 }
 

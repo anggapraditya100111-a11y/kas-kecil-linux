@@ -115,6 +115,16 @@ test('UMO menyediakan PDF tanda terima pencairan', () => {
   assert.match(server, /TANDA TERIMA UANG MUKA OPERASIONAL/);
 });
 
+test('UMO dapat dikoreksi atau dihapus secara terkontrol oleh Super User', () => {
+  assert.match(client, /data-umo-edit/);
+  assert.match(client, /data-umo-delete/);
+  assert.match(client, /Koreksi realisasi/);
+  assert.match(client, /HAPUS UMO/);
+  assert.match(server, /api\/admin\/umo\/:umoId/);
+  assert.match(server, /before-umo-change/);
+  assert.match(server, /UMO yang sedang atau sudah dipertanggungjawabkan tidak dapat dihapus/);
+});
+
 test('rekap dana per akun menyediakan filter dan export', () => {
   assert.match(client, /Rekap Dana per Akun/);
   assert.match(client, /account-summary-start/);
@@ -155,8 +165,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.5\.4/);
-  assert.match(html, /app\.js\?v=1\.5\.4/);
+  assert.match(html, /styles\.css\?v=1\.5\.5/);
+  assert.match(html, /app\.js\?v=1\.5\.5/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);

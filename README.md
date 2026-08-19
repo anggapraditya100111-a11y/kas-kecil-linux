@@ -2,6 +2,14 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.5.5
+
+- Tombol **Koreksi** dan **Hapus** ditambahkan pada kolom Aksi di menu Uang Muka Operasional.
+- UMO berstatus `PENDING` atau `OPEN` dapat dikoreksi oleh Super User; perubahan nominal otomatis menyesuaikan mutasi pencairan dan saldo.
+- UMO berstatus `PENDING`, `OPEN`, atau `REJECTED` yang belum memiliki realisasi dapat dihapus permanen setelah backup otomatis, verifikasi password, alasan, dan konfirmasi.
+- UMO yang sudah direalisasikan tidak dapat dihapus; transaksi hasil realisasinya diarahkan ke mekanisme koreksi/reversal yang sudah memiliki approval dan audit trail.
+- Periode yang sudah ditutup tetap dilindungi dari koreksi dan penghapusan UMO.
+
 ## Perbaikan versi 1.5.4
 
 - Tombol **Edit** tersedia pada kolom Aksi di menu Super User → Akun Kas untuk mengubah kode, nama, cakupan, limit auto-approval, kewajiban bukti, dan underlying document.

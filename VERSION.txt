@@ -1,6 +1,6 @@
 Kas Kecil untuk CasaOS dan Linux
-Versi: 1.5.4
-Tanggal: 2026-08-17
+Versi: 1.5.5
+Tanggal: 2026-08-19
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
@@ -41,3 +41,6 @@ Fitur utama:
 - Akun kas yang belum pernah digunakan dapat dihapus; akun bertransaksi hanya dapat dinonaktifkan
 - Akun kas dapat diedit melalui tombol Aksi tanpa mengubah relasi transaksi lama
 - Daftar akun aktif/nonaktif dapat diekspor ke Excel dan tercatat di audit log
+- UMO berstatus Pending/Open dapat dikoreksi oleh Super User dengan penyesuaian saldo otomatis
+- UMO yang belum direalisasikan dapat dihapus permanen setelah backup otomatis, password, alasan, dan konfirmasi
+- Realisasi UMO yang sudah selesai diarahkan ke reversal/koreksi transaksi agar jejak audit tetap utuh

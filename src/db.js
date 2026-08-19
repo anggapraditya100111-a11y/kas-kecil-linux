@@ -561,6 +561,7 @@ function cleanupExpiredSessions() {
 
 function backupType(fileName) {
   if (fileName.startsWith('kas-kecil-before-clear-')) return 'BEFORE_CLEAR';
+  if (fileName.startsWith('kas-kecil-before-umo-change-')) return 'BEFORE_UMO_CHANGE';
   if (fileName.startsWith('kas-kecil-manual-')) return 'MANUAL';
   return 'AUTOMATIC';
 }
@@ -586,7 +587,7 @@ function listDatabaseBackups() {
 
 async function backupDatabase(kind = 'automatic') {
   fs.mkdirSync(BACKUP_DIR, { recursive: true });
-  const labels = { automatic: 'auto', manual: 'manual', 'before-clear': 'before-clear' };
+  const labels = { automatic: 'auto', manual: 'manual', 'before-clear': 'before-clear', 'before-umo-change': 'before-umo-change' };
   const label = labels[kind] || labels.automatic;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const destination = path.join(BACKUP_DIR, `kas-kecil-${label}-${stamp}.sqlite`);
@@ -597,7 +598,8 @@ async function backupDatabase(kind = 'automatic') {
   const descriptions = {
     automatic: 'Backup database otomatis',
     manual: 'Backup database manual',
-    'before-clear': 'Backup database sebelum reset data transaksi'
+    'before-clear': 'Backup database sebelum reset data transaksi',
+    'before-umo-change': 'Backup database sebelum koreksi atau penghapusan UMO'
   };
   audit('SYSTEM', 'BACKUP', 'DATABASE', path.basename(destination), '', { kind }, descriptions[kind] || descriptions.automatic);
   return destination;

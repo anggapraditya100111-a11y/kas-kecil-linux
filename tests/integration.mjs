@@ -90,11 +90,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.5.4');
+  assert.equal(health.version, '1.5.5');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.5.4', '/styles.css?v=1.5.4']) {
+  for (const asset of ['/app.js?v=1.5.5', '/styles.css?v=1.5.5']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -254,17 +254,60 @@ async function main() {
   await assertDownload(umo.receiptPdfUrl, staffA, /application\/pdf/, 500);
   assert.equal((await request('/api/mutations', { cookie: staffA })).balance, 6600);
 
+  const staffUmoBeforeCorrection = await request('/api/umo', { cookie: staffA });
+  assert.equal(staffUmoBeforeCorrection.canManage, false);
+  const adminUmoBeforeCorrection = await request('/api/umo', { cookie: admin });
+  assert.equal(adminUmoBeforeCorrection.canManage, true);
+  assert.equal(adminUmoBeforeCorrection.rows.find(row => row.umoId === umo.umoId).canEdit, true);
+  await request(`/api/admin/umo/${umo.umoId}`, {
+    cookie: staffA, method: 'PATCH', expected: 403,
+    body: { reason: 'Percobaan tanpa akses', currentPassword: 'Staff12345' }
+  });
+  const correctedUmo = await request(`/api/admin/umo/${umo.umoId}`, {
+    cookie: admin, method: 'PATCH', body: {
+      advanceDate: today, dueDate: businessDate(4), bearerName: 'Teknisi A', advanceAmount: 450,
+      purpose: 'Pembelian kebutuhan lapangan terkoreksi', reason: 'Nominal awal salah input', currentPassword: 'Admin12345'
+    }
+  });
+  assert.match(correctedUmo.backupFileName, /^kas-kecil-before-umo-change-.*\.sqlite$/);
+  assert.equal(correctedUmo.balance, 6550);
+  const correctedUmoRow = (await request('/api/umo', { cookie: staffA })).rows.find(row => row.umoId === umo.umoId);
+  assert.equal(correctedUmoRow.advanceAmount, 450);
+  assert.equal(correctedUmoRow.purpose, 'Pembelian kebutuhan lapangan terkoreksi');
+
   const settlement = new FormData();
   settlement.set('allocations', JSON.stringify([{ accountId: outgoing.accountId, amount: 350, description: 'Pembelian kebutuhan aktual' }]));
   settlement.set('note', 'Sisa dikembalikan');
   settlement.set('receipt', new Blob([Buffer.from('%PDF-1.4\n%%EOF')], { type: 'application/pdf' }), 'nota-umo.pdf');
   const settled = await request(`/api/umo/${umo.umoId}/settlement`, { cookie: staffA, method: 'POST', form: settlement });
   assert.equal(settled.status, 'SETTLED');
-  assert.equal(settled.returnedAmount, 50);
+  assert.equal(settled.returnedAmount, 100);
   assert.equal((await request('/api/mutations', { cookie: staffA })).balance, 6650, 'UMO realization must not reduce cash twice');
   const umoRows = await request('/api/umo', { cookie: staffA });
   assert.equal(umoRows.rows[0].status, 'SETTLED');
+  assert.equal(umoRows.rows.find(row => row.umoId === umo.umoId).correctionTransactions.length, 1);
   await assertDownload(`/api/umo/${umo.umoId}/receipt`, staffA, /application\/pdf/, 10);
+  await request(`/api/admin/umo/${umo.umoId}`, {
+    cookie: admin, method: 'DELETE', expected: 409,
+    body: { reason: 'Tidak boleh menghapus UMO selesai', currentPassword: 'Admin12345', confirmation: 'HAPUS UMO' }
+  });
+
+  const disposableUmo = await request('/api/umo', {
+    cookie: staffA, method: 'POST', expected: 201,
+    body: { advanceDate: today, dueDate: businessDate(2), bearerName: 'Teknisi B', advanceAmount: 100, purpose: 'UMO salah input' }
+  });
+  assert.equal((await request('/api/mutations', { cookie: staffA })).balance, 6550);
+  await request(`/api/admin/umo/${disposableUmo.umoId}`, {
+    cookie: admin, method: 'DELETE', expected: 401,
+    body: { reason: 'Data ganda', currentPassword: 'password-salah', confirmation: 'HAPUS UMO' }
+  });
+  const deletedUmo = await request(`/api/admin/umo/${disposableUmo.umoId}`, {
+    cookie: admin, method: 'DELETE',
+    body: { reason: 'Data ganda', currentPassword: 'Admin12345', confirmation: 'HAPUS UMO' }
+  });
+  assert.match(deletedUmo.backupFileName, /^kas-kecil-before-umo-change-.*\.sqlite$/);
+  assert.equal(deletedUmo.balance, 6650);
+  assert.equal((await request('/api/umo', { cookie: staffA })).rows.some(row => row.umoId === disposableUmo.umoId), false);
 
   const correction = new FormData();
   correction.set('originalTransactionId', outResult.transactionId); correction.set('correctionType', 'REPLACEMENT');
@@ -356,11 +399,12 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.5.4', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.5.5', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,
     monthlyBudget: true, monthlyPeriodLock: true, accountDeletionGuard: true, accountEdit: true, accountExcelExport: true,
+    umoCorrectionAndDeletion: true,
     fullEncryptedBackup: true, protectedDatabaseReset: true, historicalBackup: true
   }, null, 2));
 }

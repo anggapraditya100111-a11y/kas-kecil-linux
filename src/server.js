@@ -51,7 +51,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.4';
+const APP_VERSION = '1.5.5';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -1448,7 +1448,9 @@ function umoPublic(row) {
     extraAmount: Number(row.extra_amount), settlementNote: row.settlement_note || '', receiptAvailable: Boolean(row.settlement_receipt_path),
     receiptMime: row.settlement_receipt_mime || '', createdAt: row.created_at, approvedByName: row.approved_by_name || '',
     rejectionReason: row.rejection_reason || '', approvalId: row.approval_id || '',
-    receiptPdfAvailable: ['OPEN','SETTLEMENT_PENDING','SETTLED'].includes(row.status) };
+    receiptPdfAvailable: ['OPEN','SETTLEMENT_PENDING','SETTLED'].includes(row.status),
+    canEdit: ['PENDING','OPEN'].includes(row.status), canDelete: ['PENDING','OPEN','REJECTED'].includes(row.status),
+    correctionTransactions: row.correctionTransactions || [] };
 }
 
 function finalizeUmoSettlement(umo, actorId) {
@@ -1482,12 +1484,24 @@ app.get('/api/umo', authMiddleware, (req, res, next) => {
   try {
     const canAll = hasPermission(req, 'umo.view_all');
     if (!canAll && !hasPermission(req, 'umo.view_self')) throw new AppError('Anda tidak memiliki akses UMO.', 403);
-    const rows = db.prepare(`SELECT uo.*,u.name AS user_name,au.name AS approved_by_name,
+    const rawRows = db.prepare(`SELECT uo.*,u.name AS user_name,au.name AS approved_by_name,
       (SELECT ar.id FROM approval_requests ar WHERE ar.entity_id=uo.id AND ar.decision='PENDING' ORDER BY ar.created_at DESC LIMIT 1) AS approval_id
       FROM operational_advances uo
       JOIN users u ON u.id=uo.user_id LEFT JOIN users au ON au.id=uo.approved_by ${canAll ? '' : 'WHERE uo.user_id=?'}
-      ORDER BY uo.created_at DESC LIMIT 1000`).all(...(canAll ? [] : [req.auth.user.id])).map(umoPublic);
-    res.json({ rows, balance: userBalance(req.auth.user.id), approvalLimit: Number(getSetting('UMO_APPROVAL_LIMIT', 500000)), dueDays: Number(getSetting('UMO_DUE_DAYS', 3)) });
+      ORDER BY uo.created_at DESC LIMIT 1000`).all(...(canAll ? [] : [req.auth.user.id]));
+    const visibleIds = new Set(rawRows.map(row => row.id));
+    const correctionTransactionsByUmo = db.prepare(`SELECT t.*,a.name AS account_name,u.name AS created_by_name,'' AS approved_by_name
+      FROM transactions t JOIN accounts a ON a.id=t.account_id JOIN users u ON u.id=t.created_by
+      WHERE t.source_type='UMO' AND t.status='APPROVED'
+      AND NOT EXISTS(SELECT 1 FROM transaction_corrections c WHERE c.original_transaction_id=t.id AND c.status IN ('PENDING','APPROVED'))
+      ORDER BY t.transaction_date,t.transaction_no`).all().reduce((map, row) => {
+        if (!visibleIds.has(row.source_id)) return map;
+        (map[row.source_id] ||= []).push(transactionPublic(row));
+        return map;
+      }, {});
+    const rows = rawRows.map(row => umoPublic({ ...row, correctionTransactions: correctionTransactionsByUmo[row.id] || [] }));
+    res.json({ rows, balance: userBalance(req.auth.user.id), approvalLimit: Number(getSetting('UMO_APPROVAL_LIMIT', 500000)),
+      dueDays: Number(getSetting('UMO_DUE_DAYS', 3)), canManage: req.auth.user.role === 'SUPER_USER' && hasPermission(req, 'database.manage') });
   } catch (error) { next(error); }
 });
 
@@ -1561,6 +1575,89 @@ app.post('/api/umo/:umoId/settlement', authMiddleware, upload.single('receipt'),
     res.json({ ok: true, umoNo: umo.umo_no, status: needsApproval ? 'SETTLEMENT_PENDING' : 'SETTLED', settledAmount, returnedAmount, extraAmount, approvalUrl: approvalUrl(req, rawToken) });
   } catch (error) { next(error); }
 });
+
+app.patch('/api/admin/umo/:umoId', authMiddleware, requireSuperUser, asyncRoute(async (req, res) => {
+  assertCurrentSuperUserPassword(req, req.body.currentPassword);
+  const target = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(req.params.umoId);
+  if (!target) throw new AppError('UMO tidak ditemukan.', 404);
+  if (!['PENDING','OPEN'].includes(target.status)) {
+    throw new AppError('UMO hanya dapat dikoreksi langsung saat berstatus PENDING atau OPEN. UMO yang sudah direalisasikan dikoreksi melalui reversal transaksi.', 409);
+  }
+  const openPeriod = getOpenPeriod();
+  if (target.advance_date.slice(0, 7) !== openPeriod.period_month) {
+    throw new AppError(`UMO berasal dari periode ${target.advance_date.slice(0, 7)} yang sudah ditutup. Buka kembali periode tersebut sebelum koreksi.`, 409);
+  }
+  const reason = cleanText(req.body.reason, 500);
+  if (!reason) throw new AppError('Alasan koreksi UMO wajib diisi.');
+  const advanceDate = assertOpenTransactionDate(req.body.advanceDate || target.advance_date, 'Tanggal UMO terkoreksi');
+  const dueDate = String(req.body.dueDate || target.due_date);
+  const bearerName = cleanText(req.body.bearerName ?? target.bearer_name, 120);
+  const purpose = cleanText(req.body.purpose ?? target.purpose, 500);
+  const advanceAmount = toAmount(req.body.advanceAmount ?? target.advance_amount);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || dueDate < advanceDate) throw new AppError('Batas pertanggungjawaban tidak valid.');
+  if (!bearerName || !purpose || advanceAmount <= 0) throw new AppError('Data koreksi UMO belum lengkap atau nominal tidak valid.');
+  const delta = advanceAmount - Number(target.advance_amount);
+  if (target.status === 'OPEN' && delta > 0 && userBalance(target.user_id) < delta) {
+    throw new AppError('Saldo staff tidak mencukupi untuk menambah nominal UMO.');
+  }
+  const backupPath = await backupDatabase('before-umo-change');
+  const corrected = db.transaction(() => {
+    if (target.status === 'OPEN') {
+      const ledger = db.prepare("SELECT * FROM ledger_entries WHERE source_type='UMO_ISSUE' AND source_id=? AND user_id=?").get(target.id, target.user_id);
+      if (!ledger) throw new AppError('Mutasi pencairan UMO tidak ditemukan. Koreksi dibatalkan agar saldo tetap aman.', 409);
+      db.prepare(`UPDATE ledger_entries SET entry_date=?,amount=?,description=?
+        WHERE source_type='UMO_ISSUE' AND source_id=? AND user_id=?`).run(advanceDate, advanceAmount, purpose, target.id, target.user_id);
+    }
+    db.prepare(`UPDATE operational_advances SET advance_date=?,bearer_name=?,purpose=?,advance_amount=?,due_date=? WHERE id=?`)
+      .run(advanceDate, bearerName, purpose, advanceAmount, dueDate, target.id);
+    const next = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(target.id);
+    audit(req.auth.user.id, 'CORRECT', 'UMO', target.id,
+      { advanceDate: target.advance_date, dueDate: target.due_date, bearerName: target.bearer_name, purpose: target.purpose, advanceAmount: Number(target.advance_amount) },
+      { advanceDate, dueDate, bearerName, purpose, advanceAmount, reason, backupFileName: path.basename(backupPath) },
+      `UMO ${target.umo_no} dikoreksi: ${reason}`);
+    return next;
+  })();
+  res.json({ ok: true, umo: umoPublic(corrected), backupFileName: path.basename(backupPath), balance: userBalance(target.user_id) });
+}));
+
+app.delete('/api/admin/umo/:umoId', authMiddleware, requireSuperUser, asyncRoute(async (req, res) => {
+  if (String(req.body.confirmation || '').trim().toUpperCase() !== 'HAPUS UMO') {
+    throw new AppError('Ketik HAPUS UMO untuk mengonfirmasi penghapusan.');
+  }
+  assertCurrentSuperUserPassword(req, req.body.currentPassword);
+  const target = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(req.params.umoId);
+  if (!target) throw new AppError('UMO tidak ditemukan.', 404);
+  if (!['PENDING','OPEN','REJECTED'].includes(target.status)) {
+    throw new AppError('UMO yang sedang atau sudah dipertanggungjawabkan tidak dapat dihapus. Gunakan koreksi/reversal agar riwayat tetap terlacak.', 409);
+  }
+  const reason = cleanText(req.body.reason, 500);
+  if (!reason) throw new AppError('Alasan penghapusan UMO wajib diisi.');
+  if (target.status === 'OPEN') {
+    const openPeriod = getOpenPeriod();
+    if (target.advance_date.slice(0, 7) !== openPeriod.period_month) {
+      throw new AppError(`UMO berasal dari periode ${target.advance_date.slice(0, 7)} yang sudah ditutup dan tidak dapat dihapus.`, 409);
+    }
+  }
+  const references = {
+    allocations: Number(db.prepare('SELECT COUNT(*) AS total FROM umo_allocations WHERE umo_id=?').get(target.id).total),
+    transactions: Number(db.prepare("SELECT COUNT(*) AS total FROM transactions WHERE source_type='UMO' AND source_id=?").get(target.id).total),
+    settlementLedger: Number(db.prepare("SELECT COUNT(*) AS total FROM ledger_entries WHERE source_id=? AND source_type IN ('UMO_RETURN','UMO_EXTRA')").get(target.id).total)
+  };
+  if (references.allocations || references.transactions || references.settlementLedger) {
+    throw new AppError('UMO sudah memiliki realisasi atau transaksi turunan dan tidak dapat dihapus. Gunakan koreksi/reversal.', 409);
+  }
+  const backupPath = await backupDatabase('before-umo-change');
+  db.transaction(() => {
+    db.prepare("DELETE FROM approval_requests WHERE entity_id=? AND entity_type IN ('UMO_ISSUE','UMO_SETTLEMENT')").run(target.id);
+    db.prepare("DELETE FROM ledger_entries WHERE source_id=? AND source_type IN ('UMO_ISSUE','UMO_RETURN','UMO_EXTRA')").run(target.id);
+    db.prepare('DELETE FROM umo_allocations WHERE umo_id=?').run(target.id);
+    db.prepare('DELETE FROM operational_advances WHERE id=?').run(target.id);
+    audit(req.auth.user.id, 'DELETE', 'UMO', target.id,
+      { umoNo: target.umo_no, status: target.status, advanceAmount: Number(target.advance_amount), advanceDate: target.advance_date },
+      { reason, backupFileName: path.basename(backupPath) }, `UMO ${target.umo_no} dihapus permanen: ${reason}`);
+  })();
+  res.json({ ok: true, umoId: target.id, umoNo: target.umo_no, backupFileName: path.basename(backupPath), balance: userBalance(target.user_id) });
+}));
 
 app.get('/api/umo/:umoId/receipt', authMiddleware, (req, res, next) => {
   try {
@@ -2042,7 +2139,7 @@ app.patch('/api/admin/settings', authMiddleware, requirePermission('settings.man
 });
 
 function backupPublic(record) {
-  const labels = { AUTOMATIC: 'Otomatis', MANUAL: 'Manual', BEFORE_CLEAR: 'Sebelum reset' };
+  const labels = { AUTOMATIC: 'Otomatis', MANUAL: 'Manual', BEFORE_CLEAR: 'Sebelum reset', BEFORE_UMO_CHANGE: 'Sebelum perubahan UMO' };
   return {
     fileName: record.fileName,
     type: record.type,
