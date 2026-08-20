@@ -40,9 +40,23 @@ async function login(username, password) {
   return setCookie.split(';')[0];
 }
 
-async function request(route, { cookie, method = 'GET', body, form, expected = 200 } = {}) {
+async function mobileLogin(username, password) {
+  const response = await fetch(`${baseUrl}/api/mobile/auth/login`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, deviceName: 'Android Integration Test' })
+  });
+  const payload = await response.json();
+  assert.equal(response.status, 200, payload.error);
+  assert.equal(payload.tokenType, 'Bearer');
+  assert(payload.accessToken, 'Mobile access token missing');
+  assert(new Date(payload.expiresAt).getTime() > Date.now());
+  return payload.accessToken;
+}
+
+async function request(route, { cookie, bearer, method = 'GET', body, form, expected = 200 } = {}) {
   const headers = {};
   if (cookie) headers.Cookie = cookie;
+  if (bearer) headers.Authorization = `Bearer ${bearer}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   const response = await fetch(`${baseUrl}${route}`, { method, headers, body: form || (body === undefined ? undefined : JSON.stringify(body)) });
   const contentType = response.headers.get('content-type') || '';
@@ -90,11 +104,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.5.5');
+  assert.equal(health.version, '1.6.0');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.5.5', '/styles.css?v=1.5.5']) {
+  for (const asset of ['/app.js?v=1.6.0', '/styles.css?v=1.6.0']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -102,6 +116,11 @@ async function main() {
   }
 
   const admin = await login('admin', 'Admin12345');
+  const mobileAdmin = await mobileLogin('admin', 'Admin12345');
+  const mobileBootstrap = await request('/api/bootstrap', { bearer: mobileAdmin });
+  assert.equal(mobileBootstrap.user.username, 'admin');
+  await request('/api/mobile/auth/logout', { bearer: mobileAdmin, method: 'POST' });
+  await request('/api/bootstrap', { bearer: mobileAdmin, expected: 401 });
   await request('/api/admin/settings', {
     cookie: admin, method: 'PATCH', body: { APP_NAME: 'Kas Kecil Uji', COMPANY_NAME: 'Perusahaan Uji', THEME_COLOR: '#7c3aed' }
   });
@@ -399,7 +418,7 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.5.5', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.6.0', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,

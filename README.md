@@ -2,6 +2,14 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.6.0
+
+- API autentikasi khusus aplikasi Android ditambahkan melalui Bearer token.
+- Masa aktif sesi Android dapat diatur melalui `MOBILE_SESSION_DAYS` dengan bawaan 30 hari.
+- Token Android dapat digunakan pada API yang sama sesuai role dan hak akses pengguna.
+- Login web tetap memakai cookie aman seperti sebelumnya dan tidak berubah.
+- Logout Android atau perubahan password langsung mencabut token sesi terkait.
+
 ## Perbaikan versi 1.5.5
 
 - Tombol **Koreksi** dan **Hapus** ditambahkan pada kolom Aksi di menu Uang Muka Operasional.
@@ -103,9 +111,12 @@ Pasang reverse proxy yang mengarah ke `http://IP-SERVER:8090`, aktifkan HTTPS, k
 ```env
 TRUST_PROXY=true
 COOKIE_SECURE=true
+MOBILE_SESSION_DAYS=30
 ```
 
 Terapkan perubahan dengan `docker compose up -d`. Tautan approval harus menggunakan domain/IP yang dapat dijangkau perangkat approver. Jangan membuka aplikasi ke internet tanpa HTTPS, firewall, dan pembatasan akses yang sesuai.
+
+`MOBILE_SESSION_DAYS` mengatur masa aktif token aplikasi Android (bawaan 30 hari). Token dapat dicabut melalui logout atau otomatis saat password pengguna diubah.
 
 ## Perintah pemeliharaan
 

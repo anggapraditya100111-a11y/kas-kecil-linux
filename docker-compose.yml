@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kas-kecil:1.5.5
+    image: kas-kecil:1.6.0
     container_name: kas-kecil
     restart: unless-stopped
     ports:
@@ -23,6 +23,7 @@ services:
       SERVICE_NAME: "${SERVICE_NAME:-kas-kecil}"
       TRUST_PROXY: "${TRUST_PROXY:-false}"
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      MOBILE_SESSION_DAYS: "${MOBILE_SESSION_DAYS:-30}"
       DATA_DIR: /app/data
       UPLOAD_DIR: /app/uploads
       BACKUP_DIR: /app/backups

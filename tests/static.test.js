@@ -67,6 +67,15 @@ test('blokir 15 menit dihapus dan kegagalan dibatasi singkat', () => {
   assert.match(server, /skipSuccessfulRequests: true/);
 });
 
+test('autentikasi Android memakai Bearer token terpisah tanpa mengubah login web', () => {
+  assert.match(server, /api\/mobile\/auth\/login/);
+  assert.match(server, /api\/mobile\/auth\/logout/);
+  assert.match(server, /LOGIN_MOBILE/);
+  assert.match(server, /Authorization|authorization/);
+  assert.match(server, /MOBILE_SESSION_DAYS/);
+  assert.match(server, /res\.cookie\(COOKIE_NAME/);
+});
+
 test('nomor dokumen diselaraskan dengan nomor yang sudah tersimpan', () => {
   assert.match(server, /existingSequence/);
   assert.match(server, /Math\.max\(storedSequence, existingSequence\) \+ 1/);
@@ -165,8 +174,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.5\.5/);
-  assert.match(html, /app\.js\?v=1\.5\.5/);
+  assert.match(html, /styles\.css\?v=1\.6\.0/);
+  assert.match(html, /app\.js\?v=1\.6\.0/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);

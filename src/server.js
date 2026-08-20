@@ -51,7 +51,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.5.5';
+const APP_VERSION = '1.6.0';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -59,6 +59,7 @@ const DEFAULT_COMPANY_NAME = process.env.DEFAULT_COMPANY_NAME || 'Nama Perusahaa
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
 const COOKIE_NAME = 'kk_session';
 const SESSION_HOURS = () => Number(getSetting('SESSION_HOURS', 8)) || 8;
+const MOBILE_SESSION_DAYS = Math.max(1, Math.min(365, Number(process.env.MOBILE_SESSION_DAYS || 30) || 30));
 const APP_TIMEZONE = () => String(getSetting('TIMEZONE', 'Asia/Jakarta'));
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -204,8 +205,33 @@ const loginLimiter = rateLimit({
   message: { error: 'Terlalu banyak kesalahan login. Tunggu maksimal 1 menit lalu coba kembali.' }
 });
 
+function requestSessionToken(req) {
+  const authorization = String(req.get('authorization') || '').trim();
+  const bearer = authorization.match(/^Bearer\s+([^\s]+)$/i);
+  return bearer?.[1] || req.cookies[COOKIE_NAME] || '';
+}
+
+function createUserSession(user, durationMs) {
+  const rawToken = randomToken();
+  const now = new Date();
+  const expires = new Date(now.getTime() + durationMs);
+  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)')
+    .run(hashToken('SESSION', rawToken), user.id, now.toISOString(), expires.toISOString(), now.toISOString());
+  db.prepare('UPDATE users SET last_login=?, updated_at=? WHERE id=?').run(now.toISOString(), now.toISOString(), user.id);
+  return { rawToken, expiresAt: expires.toISOString() };
+}
+
+function authenticateCredentials(usernameValue, passwordValue) {
+  const username = cleanUsername(usernameValue);
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!user || !user.active || !verifyPassword(String(passwordValue || ''), user.password_salt, user.password_hash)) {
+    throw new AppError('Username atau password salah.', 401);
+  }
+  return user;
+}
+
 function authMiddleware(req, _res, next) {
-  const rawToken = req.cookies[COOKIE_NAME];
+  const rawToken = requestSessionToken(req);
   if (!rawToken) return next(new AppError('Silakan login kembali.', 401));
   const session = db.prepare(`
     SELECT s.*, u.id AS uid, u.name, u.username, u.role, u.active, u.last_login
@@ -581,17 +607,8 @@ app.get('/api/branding/logo', (_req, res, next) => {
 
 app.post('/api/auth/login', loginLimiter, (req, res, next) => {
   try {
-    const username = cleanUsername(req.body.username);
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    if (!user || !user.active || !verifyPassword(String(req.body.password || ''), user.password_salt, user.password_hash)) {
-      throw new AppError('Username atau password salah.', 401);
-    }
-    const rawToken = randomToken();
-    const now = new Date();
-    const expires = new Date(now.getTime() + SESSION_HOURS() * 60 * 60 * 1000);
-    db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)')
-      .run(hashToken('SESSION', rawToken), user.id, now.toISOString(), expires.toISOString(), now.toISOString());
-    db.prepare('UPDATE users SET last_login=?, updated_at=? WHERE id=?').run(now.toISOString(), now.toISOString(), user.id);
+    const user = authenticateCredentials(req.body.username, req.body.password);
+    const { rawToken } = createUserSession(user, SESSION_HOURS() * 60 * 60 * 1000);
     audit(user.id, 'LOGIN', 'SESSION', '', '', '', 'Login berhasil');
     res.cookie(COOKIE_NAME, rawToken, {
       httpOnly: true,
@@ -604,10 +621,32 @@ app.post('/api/auth/login', loginLimiter, (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/mobile/auth/login', loginLimiter, (req, res, next) => {
+  try {
+    const user = authenticateCredentials(req.body.username, req.body.password);
+    const deviceName = cleanText(req.body.deviceName || 'Perangkat Android', 120);
+    const { rawToken, expiresAt } = createUserSession(user, MOBILE_SESSION_DAYS * 24 * 60 * 60 * 1000);
+    audit(user.id, 'LOGIN_MOBILE', 'SESSION', '', '', { deviceName }, `Login Android: ${deviceName}`);
+    res.json({
+      tokenType: 'Bearer',
+      accessToken: rawToken,
+      expiresAt,
+      user: publicUser(user),
+      permissions: getUserPermissions(user.id, user.role)
+    });
+  } catch (error) { next(error); }
+});
+
 app.post('/api/auth/logout', authMiddleware, (req, res) => {
   db.prepare('UPDATE sessions SET revoked_at=? WHERE token_hash=?').run(nowIso(), req.auth.sessionHash);
   audit(req.auth.user.id, 'LOGOUT', 'SESSION', '', '', '', 'Logout');
   res.clearCookie(COOKIE_NAME, { path: '/' });
+  res.json({ ok: true });
+});
+
+app.post('/api/mobile/auth/logout', authMiddleware, (req, res) => {
+  db.prepare('UPDATE sessions SET revoked_at=? WHERE token_hash=?').run(nowIso(), req.auth.sessionHash);
+  audit(req.auth.user.id, 'LOGOUT_MOBILE', 'SESSION', '', '', '', 'Logout Android');
   res.json({ ok: true });
 });
 
