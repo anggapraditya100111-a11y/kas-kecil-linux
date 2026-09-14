@@ -49,6 +49,10 @@ test('database v1.0 dimigrasikan tanpa kehilangan transaksi', () => {
   assert.equal(db.prepare("SELECT value FROM settings WHERE key='COMPANY_LOGO_FILE'").get().value, '');
   assert(db.prepare('PRAGMA table_info(accounts)').all().some(column => column.name === 'underlying_required'));
   assert(db.prepare('PRAGMA table_info(transactions)').all().some(column => column.name === 'underlying_path'));
+  for (const column of ['email', 'auth_source', 'access_subject', 'access_groups_json', 'access_last_sync_at']) {
+    assert(db.prepare('PRAGMA table_info(users)').all().some(item => item.name === column), `users.${column} belum dibuat`);
+  }
+  assert(db.prepare('PRAGMA table_info(sessions)').all().some(column => column.name === 'auth_source'));
   for (const table of ['accounting_periods', 'period_balances', 'cash_budgets', 'cash_budget_allocations']) {
     assert(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table), `${table} belum dibuat`);
   }

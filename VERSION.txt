@@ -1,6 +1,6 @@
-Kas Kecil untuk CasaOS dan Linux
-Versi: 1.6.0
-Tanggal: 2026-08-20
+Kas Kecil untuk Ubuntu dan Linux
+Versi: 1.7.0
+Tanggal: 2026-09-14
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL

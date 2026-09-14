@@ -22,6 +22,7 @@ const {
   getSetting,
   setSetting,
   publicUser,
+  upsertAccessUser,
   getUserPermissions,
   audit,
   cleanupExpiredSessions,
@@ -31,6 +32,7 @@ const {
   localPeriodMonth
 } = require('./db');
 const { ROLE_DEFAULTS } = require('./permissions');
+const access = require('./access');
 const {
   randomToken,
   hashToken,
@@ -51,7 +53,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -171,6 +173,7 @@ const app = express();
 app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 app.disable('x-powered-by');
 app.use(helmet({
+  crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
@@ -211,12 +214,12 @@ function requestSessionToken(req) {
   return bearer?.[1] || req.cookies[COOKIE_NAME] || '';
 }
 
-function createUserSession(user, durationMs) {
+function createUserSession(user, durationMs, authSource = user.auth_source || 'LOCAL') {
   const rawToken = randomToken();
   const now = new Date();
   const expires = new Date(now.getTime() + durationMs);
-  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)')
-    .run(hashToken('SESSION', rawToken), user.id, now.toISOString(), expires.toISOString(), now.toISOString());
+  db.prepare('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,last_seen_at,auth_source) VALUES(?,?,?,?,?,?)')
+    .run(hashToken('SESSION', rawToken), user.id, now.toISOString(), expires.toISOString(), now.toISOString(), authSource);
   db.prepare('UPDATE users SET last_login=?, updated_at=? WHERE id=?').run(now.toISOString(), now.toISOString(), user.id);
   return { rawToken, expiresAt: expires.toISOString() };
 }
@@ -234,7 +237,8 @@ function authMiddleware(req, _res, next) {
   const rawToken = requestSessionToken(req);
   if (!rawToken) return next(new AppError('Silakan login kembali.', 401));
   const session = db.prepare(`
-    SELECT s.*, u.id AS uid, u.name, u.username, u.role, u.active, u.last_login
+    SELECT s.*, s.auth_source AS session_auth_source, u.id AS uid, u.name, u.username, u.email,
+      u.role, u.active, u.last_login, u.auth_source AS user_auth_source, u.approval_pin_hash
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ?
   `).get(hashToken('SESSION', rawToken));
@@ -248,9 +252,13 @@ function authMiddleware(req, _res, next) {
     id: session.uid,
     name: session.name,
     username: session.username,
+    email: session.email || '',
     role: session.role,
     active: session.active,
-    last_login: session.last_login
+    last_login: session.last_login,
+    auth_source: session.user_auth_source || session.session_auth_source || 'LOCAL',
+    session_auth_source: session.session_auth_source || 'LOCAL',
+    approval_pin_hash: session.approval_pin_hash
   };
   req.auth = { user, permissions: new Set(getUserPermissions(user.id, user.role)), sessionHash: session.token_hash };
   next();
@@ -276,6 +284,21 @@ function hasPermission(req, code) {
 
 function revokeUserSessions(userId) {
   db.prepare('UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL').run(nowIso(), userId);
+}
+
+function setWebSessionCookie(res, rawToken) {
+  res.cookie(COOKIE_NAME, rawToken, {
+    httpOnly: true,
+    secure: process.env.COOKIE_SECURE === 'true',
+    sameSite: 'strict',
+    maxAge: SESSION_HOURS() * 60 * 60 * 1000,
+    path: '/'
+  });
+}
+
+function assertLocalPasswordUser(user, message = 'Gunakan login Super User darurat untuk tindakan yang memerlukan password lokal.') {
+  if (!user || (user.auth_source || 'LOCAL') !== 'LOCAL') throw new AppError(message, 403);
+  return user;
 }
 
 function accountPublic(row) {
@@ -457,7 +480,9 @@ function publicAppConfig() {
     appName: String(getSetting('APP_NAME', DEFAULT_APP_NAME)),
     companyName: String(getSetting('COMPANY_NAME', DEFAULT_COMPANY_NAME)),
     themeColor: /^#[0-9a-f]{6}$/i.test(themeColor) ? themeColor : '#1d4ed8',
-    logoUrl: logoFile ? `/api/branding/logo?v=${encodeURIComponent(logoFile)}` : ''
+    logoUrl: logoFile ? `/api/branding/logo?v=${encodeURIComponent(logoFile)}` : '',
+    appVersion: APP_VERSION,
+    auth: access.publicAuth()
   };
 }
 
@@ -605,18 +630,25 @@ app.get('/api/branding/logo', (_req, res, next) => {
   } catch (error) { next(error); }
 });
 
+access.register(app, {
+  rateLimit,
+  completeLogin: async ({ identity, groups, role }, req, res) => {
+    const provisioned = upsertAccessUser(identity, groups, role);
+    const user = db.prepare('SELECT * FROM users WHERE id=?').get(provisioned.userId);
+    const { rawToken } = createUserSession(user, SESSION_HOURS() * 60 * 60 * 1000, 'ACCESS');
+    audit(user.id, 'ACCESS_HANDOFF_LOGIN', 'SESSION', '', '', { role, groups }, 'Login melalui AXINDO Access');
+    setWebSessionCookie(res, rawToken);
+    return { user: publicUser(user), permissions: getUserPermissions(user.id, user.role) };
+  }
+});
+
 app.post('/api/auth/login', loginLimiter, (req, res, next) => {
   try {
     const user = authenticateCredentials(req.body.username, req.body.password);
+    if (!access.allowLocalUser(user)) throw new AppError('Gunakan AXINDO ID. Login lokal hanya untuk Super User darurat.', 403);
     const { rawToken } = createUserSession(user, SESSION_HOURS() * 60 * 60 * 1000);
     audit(user.id, 'LOGIN', 'SESSION', '', '', '', 'Login berhasil');
-    res.cookie(COOKIE_NAME, rawToken, {
-      httpOnly: true,
-      secure: process.env.COOKIE_SECURE === 'true',
-      sameSite: 'lax',
-      maxAge: SESSION_HOURS() * 60 * 60 * 1000,
-      path: '/'
-    });
+    setWebSessionCookie(res, rawToken);
     res.json({ user: publicUser(user), permissions: getUserPermissions(user.id, user.role) });
   } catch (error) { next(error); }
 });
@@ -652,7 +684,7 @@ app.post('/api/mobile/auth/logout', authMiddleware, (req, res) => {
 
 app.post('/api/auth/change-password', authMiddleware, (req, res, next) => {
   try {
-    const fullUser = db.prepare('SELECT * FROM users WHERE id=?').get(req.auth.user.id);
+    const fullUser = assertLocalPasswordUser(db.prepare('SELECT * FROM users WHERE id=?').get(req.auth.user.id), 'Password AXINDO ID dikelola melalui menu Keamanan di AXINDO Access.');
     if (!verifyPassword(String(req.body.oldPassword || ''), fullUser.password_salt, fullUser.password_hash)) throw new AppError('Password lama tidak sesuai.');
     assertPassword(req.body.newPassword);
     const passwordData = hashPassword(req.body.newPassword);
@@ -1383,7 +1415,7 @@ app.post('/api/periods/:periodMonth/reopen', authMiddleware, requireSuperUser, a
   const target = db.prepare("SELECT * FROM accounting_periods WHERE period_month=? AND status='CLOSED'").get(String(req.params.periodMonth));
   const open = getOpenPeriod();
   if (!target || nextPeriodMonth(target.period_month) !== open.period_month) throw new AppError('Hanya periode terakhir sebelum periode terbuka yang dapat dibuka kembali.');
-  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  const user = assertLocalPasswordUser(db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id));
   if (!user || !verifyPassword(String(req.body.currentPassword || ''), user.password_salt, user.password_hash)) throw new AppError('Password Super User tidak sesuai.', 401);
   const reason = cleanText(req.body.reason, 500);
   if (!reason) throw new AppError('Alasan membuka kembali periode wajib diisi.');
@@ -1895,16 +1927,19 @@ app.post('/api/admin/users', authMiddleware, requirePermission('users.manage'), 
   try {
     const name = cleanText(req.body.name, 120);
     const username = cleanUsername(req.body.username);
+    const email = String(req.body.email || '').trim().toLowerCase();
     const role = String(req.body.role || '').toUpperCase();
     if (!name || !/^[a-z0-9._-]{3,40}$/.test(username)) throw new AppError('Nama atau username tidak valid.');
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new AppError('Email AXINDO ID tidak valid.');
     if (!['STAFF', 'SPV', 'SUPER_USER'].includes(role)) throw new AppError('Role pengguna tidak valid.');
+    if (access.enabled && role !== 'SUPER_USER') throw new AppError('Akun Staff dan SPV dibuat melalui AXINDO Access. Akun lokal baru hanya untuk Super User darurat.');
     assertPassword(req.body.password);
     const passwordData = hashPassword(req.body.password);
     const id = newId('USR');
     const now = nowIso();
-    db.prepare('INSERT INTO users(id,name,username,password_hash,password_salt,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)')
-      .run(id, name, username, passwordData.hash, passwordData.salt, role, now, now);
-    audit(req.auth.user.id, 'CREATE', 'USER', id, '', { name, username, role }, 'Pengguna dibuat');
+    db.prepare('INSERT INTO users(id,name,username,email,password_hash,password_salt,role,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)')
+      .run(id, name, username, email || null, passwordData.hash, passwordData.salt, role, now, now);
+    audit(req.auth.user.id, 'CREATE', 'USER', id, '', { name, username, email, role }, 'Pengguna lokal dibuat');
     res.status(201).json({ ok: true, userId: id });
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) return next(new AppError('Username sudah digunakan.'));
@@ -1916,21 +1951,28 @@ app.patch('/api/admin/users/:userId', authMiddleware, requirePermission('users.m
   try {
     const target = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.userId);
     if (!target) throw new AppError('Pengguna tidak ditemukan.', 404);
+    const accessManaged = (target.auth_source || 'LOCAL') === 'ACCESS';
+    if (accessManaged && ['name', 'username', 'email', 'role', 'password'].some(field => req.body[field] !== undefined)) {
+      throw new AppError('Identitas, role, dan password pengguna AXINDO ID dikelola melalui AXINDO Access.', 403);
+    }
     const patch = {
       name: req.body.name === undefined ? target.name : cleanText(req.body.name, 120),
       username: req.body.username === undefined ? target.username : cleanUsername(req.body.username),
+      email: req.body.email === undefined ? (target.email || '') : String(req.body.email || '').trim().toLowerCase(),
       role: req.body.role === undefined ? target.role : String(req.body.role).toUpperCase(),
       active: req.body.active === undefined ? target.active : Number(toBoolean(req.body.active))
     };
     if (!patch.name || !/^[a-z0-9._-]{3,40}$/.test(patch.username)) throw new AppError('Nama atau username tidak valid.');
+    if (patch.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(patch.email)) throw new AppError('Email AXINDO ID tidak valid.');
     if (!['STAFF', 'SPV', 'SUPER_USER'].includes(patch.role)) throw new AppError('Role tidak valid.');
     if (target.id === req.auth.user.id && !patch.active) throw new AppError('Anda tidak dapat menonaktifkan akun sendiri.');
 
     const updateUser = db.transaction(() => {
-      db.prepare('UPDATE users SET name=?,username=?,role=?,active=?,updated_at=? WHERE id=?')
-        .run(patch.name, patch.username, patch.role, patch.active, nowIso(), target.id);
+      db.prepare('UPDATE users SET name=?,username=?,email=?,role=?,active=?,updated_at=? WHERE id=?')
+        .run(patch.name, patch.username, patch.email || null, patch.role, patch.active, nowIso(), target.id);
       if (patch.role !== target.role) db.prepare('DELETE FROM user_permissions WHERE user_id=?').run(target.id);
       if (req.body.password) {
+        assertLocalPasswordUser(target, 'Password pengguna AXINDO ID dikelola melalui AXINDO Access.');
         assertPassword(req.body.password);
         const passwordData = hashPassword(req.body.password);
         db.prepare('UPDATE users SET password_hash=?,password_salt=? WHERE id=?').run(passwordData.hash, passwordData.salt, target.id);
@@ -1972,7 +2014,7 @@ app.put('/api/admin/users/:userId/approval-pin', authMiddleware, requirePermissi
 
 app.put('/api/auth/approval-pin', authMiddleware, (req, res, next) => {
   try {
-    const user = db.prepare('SELECT * FROM users WHERE id=?').get(req.auth.user.id);
+    const user = assertLocalPasswordUser(db.prepare('SELECT * FROM users WHERE id=?').get(req.auth.user.id), 'PIN approval akun AXINDO ID ditetapkan oleh Super User Kas Kecil.');
     if (!verifyPassword(String(req.body.currentPassword || ''), user.password_salt, user.password_hash)) throw new AppError('Password saat ini tidak sesuai.');
     saveApprovalPin(user.id, String(req.body.pin || ''), user.id);
     res.json({ ok: true });
@@ -2196,7 +2238,7 @@ function assertBackupPassword(password) {
 }
 
 function assertCurrentSuperUserPassword(req, password) {
-  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  const user = assertLocalPasswordUser(db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id));
   if (!user || !verifyPassword(String(password || ''), user.password_salt, user.password_hash)) {
     throw new AppError('Password Super User tidak sesuai.', 401);
   }
@@ -2468,7 +2510,7 @@ app.post('/api/admin/database/clear', authMiddleware, requireSuperUser, asyncRou
   if (String(req.body.confirmation || '').trim().toUpperCase() !== 'HAPUS DATA TRANSAKSI') {
     throw new AppError('Ketik HAPUS DATA TRANSAKSI untuk mengonfirmasi reset.');
   }
-  const user = db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id);
+  const user = assertLocalPasswordUser(db.prepare('SELECT * FROM users WHERE id=? AND active=1').get(req.auth.user.id));
   if (!user || !verifyPassword(String(req.body.currentPassword || ''), user.password_salt, user.password_hash)) {
     throw new AppError('Password Super User tidak sesuai.', 401);
   }

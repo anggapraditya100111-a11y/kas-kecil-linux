@@ -13,7 +13,8 @@ const state = {
   openPeriod: null,
   umoCanManage: false,
   pendingCorrectionTransactionId: '',
-  pendingCorrectionReason: ''
+  pendingCorrectionReason: '',
+  accessPopup: null
 };
 
 const pages = [
@@ -35,11 +36,13 @@ const pages = [
   { id: 'settings', label: 'Pengaturan', group: 'Super User', any: ['settings.manage'] },
   { id: 'database', label: 'Pemeliharaan Data', group: 'Super User', any: ['database.manage'] },
   { id: 'audit', label: 'Audit Log', group: 'Super User', any: ['audit.view'] },
-  { id: 'profile', label: 'Ubah Password', group: 'Akun', always: true }
+  { id: 'profile', label: 'Keamanan Akun', group: 'Akun', always: true }
 ];
 
 document.addEventListener('DOMContentLoaded', init);
 document.getElementById('login-form').addEventListener('submit', login);
+document.getElementById('access-login-button')?.addEventListener('click', startAccessLogin);
+document.getElementById('local-login-toggle')?.addEventListener('click', () => document.getElementById('local-login-area')?.classList.toggle('hidden'));
 document.getElementById('logout-button').addEventListener('click', logout);
 document.getElementById('modal-close').addEventListener('click', closeModal);
 document.getElementById('modal').addEventListener('click', event => { if (event.target.id === 'modal') closeModal(); });
@@ -49,6 +52,7 @@ document.querySelectorAll('.theme-toggle').forEach(button => button.addEventList
 document.addEventListener('input', event => {
   if (event.target.matches('.money-input')) event.target.value = formatMoneyInput(event.target.value);
 });
+window.addEventListener('message', handleAccessMessage);
 
 async function init() {
   applySavedTheme();
@@ -60,10 +64,15 @@ async function init() {
       await renderPublicApproval();
       return;
     }
+    const redirected = await completeRedirectedAccessHandoff();
     await bootstrap();
     showApp();
     const target = approvalToken && allowedPage('approval') ? 'approval' : firstAllowedPage();
     await openPage(target);
+    if (redirected) {
+      toast('Login AXINDO ID berhasil.');
+      setTimeout(() => { try { window.close(); } catch {} }, 400);
+    }
   } catch (error) {
     if (error.status !== 401) toast(error.message, true);
     if (!approvalToken) showLogin();
@@ -149,6 +158,163 @@ async function apiBlob(url, options = {}) {
     throw new Error(message);
   }
   return { blob: await response.blob(), disposition: response.headers.get('content-disposition') || '' };
+}
+
+function isAccessUser(user = state.user) {
+  return (user?.authSource || user?.auth_source) === 'ACCESS';
+}
+
+function configureAccessLogin(auth = {}) {
+  const enabled = Boolean(auth.accessHandoffEnabled);
+  const ready = Boolean(auth.accessHandoffReady);
+  const local = auth.localLoginEnabled !== false;
+  document.getElementById('access-login-area')?.classList.toggle('hidden', !enabled);
+  const accessButton = document.getElementById('access-login-button');
+  if (accessButton) accessButton.disabled = !ready;
+  const status = document.getElementById('access-login-status');
+  if (status) status.textContent = ready
+    ? `Login aman melalui ${new URL(auth.accessPortalUrl || 'https://akses.axindo.my.id').hostname}.`
+    : 'Koneksi AXINDO Access belum aktif pada server.';
+  document.getElementById('local-login-toggle')?.classList.toggle('hidden', !local || !enabled);
+  document.getElementById('local-login-area')?.classList.toggle('hidden', enabled || !local);
+  const description = document.getElementById('login-description');
+  if (description) description.textContent = enabled
+    ? 'Gunakan AXINDO ID. Login lokal hanya tersedia untuk Super User darurat.'
+    : 'Gunakan akun internal yang diberikan Super User.';
+}
+
+function randomAccessChannel() {
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return `kas_kecil_${Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function randomAccessVerifier() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+async function accessChallenge(verifier) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  let binary = '';
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+}
+
+function accessStorageKey(channel) { return `kas-kecil-handoff:${channel}`; }
+
+async function accessHandoffUrl(channel, verifier) {
+  const auth = state.config?.auth || {};
+  const challenge = await accessChallenge(verifier);
+  const url = new URL(auth.accessPortalPopupUrl || `${auth.accessPortalUrl || 'https://akses.axindo.my.id'}/handoff?handoff=kas-kecil`);
+  url.searchParams.set('handoff', 'kas-kecil');
+  url.searchParams.set('channel', channel);
+  url.searchParams.set('return_origin', location.origin);
+  url.searchParams.set('code_challenge', challenge);
+  url.searchParams.set('code_challenge_method', 'S256');
+  return url.toString();
+}
+
+async function exchangeAccess(code, verifier) {
+  return api('/api/auth/access/complete', { method: 'POST', body: { code, verifier } });
+}
+
+async function completeRedirectedAccessHandoff() {
+  const params = new URLSearchParams(location.hash.replace(/^#/, ''));
+  if (params.get('access_handoff') !== '1') return null;
+  const channel = String(params.get('channel') || '');
+  const code = String(params.get('code') || '');
+  const verifier = sessionStorage.getItem(accessStorageKey(channel)) || '';
+  history.replaceState({}, document.title, location.pathname + location.search);
+  if (!/^kas_kecil_[a-f0-9]{48}$/.test(channel)
+    || !/^[a-zA-Z0-9_-]{40,200}$/.test(code)
+    || !/^[a-zA-Z0-9_-]{43,128}$/.test(verifier)) {
+    throw new Error('Kode login AXINDO Access tidak valid atau kedaluwarsa.');
+  }
+  await exchangeAccess(code, verifier);
+  sessionStorage.removeItem(accessStorageKey(channel));
+  return { channel };
+}
+
+function finishAccessPopup(ok, message = '') {
+  const active = state.accessPopup;
+  if (active?.monitor) clearInterval(active.monitor);
+  if (active?.channel) sessionStorage.removeItem(accessStorageKey(active.channel));
+  state.accessPopup = null;
+  if (!ok) {
+    if (message) toast(message, true);
+    return;
+  }
+  setLoading(true);
+  bootstrap().then(async () => {
+    showApp();
+    await openPage(firstAllowedPage());
+    toast('Login AXINDO ID berhasil.');
+  }).catch(error => toast(error.message, true)).finally(() => setLoading(false));
+}
+
+async function handleAccessMessage(event) {
+  const active = state.accessPopup;
+  if (!active || event.source !== active.window || event.origin !== active.accessOrigin) return;
+  const data = event.data || {};
+  if (data.type !== 'axindo-access-handoff' || data.channel !== active.channel) return;
+  if (data.status !== 'success' || !/^[a-zA-Z0-9_-]{40,200}$/.test(String(data.code || ''))) {
+    finishAccessPopup(false, data.message || 'Login AXINDO ID gagal.');
+    return;
+  }
+  active.stage = 'exchange';
+  try {
+    await exchangeAccess(String(data.code), active.verifier);
+    finishAccessPopup(true);
+  } catch (error) { finishAccessPopup(false, error.message); }
+}
+
+async function startAccessLogin() {
+  const auth = state.config?.auth || {};
+  if (!auth.accessHandoffReady) return toast('Koneksi AXINDO Access belum aktif.', true);
+  const channel = randomAccessChannel();
+  const verifier = randomAccessVerifier();
+  sessionStorage.setItem(accessStorageKey(channel), verifier);
+  const url = await accessHandoffUrl(channel, verifier);
+  const mobile = matchMedia('(max-width: 820px)').matches || /iPhone|iPad|Android/i.test(navigator.userAgent);
+  if (mobile) {
+    location.assign(url);
+    return;
+  }
+  const popup = window.open('about:blank', channel, 'popup=yes,width=470,height=720,resizable=yes,scrollbars=yes');
+  if (!popup) {
+    location.assign(url);
+    return;
+  }
+  state.accessPopup = {
+    window: popup,
+    channel,
+    verifier,
+    stage: 'handoff',
+    accessOrigin: auth.accessPortalOrigin || new URL(auth.accessPortalUrl || 'https://akses.axindo.my.id').origin,
+    closedAt: 0,
+    checking: false
+  };
+  popup.location.replace(url);
+  state.accessPopup.monitor = setInterval(() => {
+    const active = state.accessPopup;
+    if (!active || !popup.closed) {
+      if (active) active.closedAt = 0;
+      return;
+    }
+    if (active.stage === 'exchange') return;
+    if (!active.closedAt) {
+      active.closedAt = Date.now();
+      return;
+    }
+    if (Date.now() - active.closedAt < 1500 || active.checking) return;
+    active.checking = true;
+    api('/api/bootstrap').then(() => finishAccessPopup(true))
+      .catch(() => finishAccessPopup(false, 'Popup login ditutup sebelum proses selesai.'));
+  }, 300);
 }
 
 async function login(event) {
@@ -812,9 +978,10 @@ function bindApprovalButtons() {
 
 async function renderUsers() {
   const data = await api('/api/admin/users');
+  const accessEnabled = Boolean(state.config?.auth?.accessHandoffEnabled);
   document.getElementById('page').innerHTML = `
-    <div class="page-head"><div><h2>Pengguna</h2><p>Buat akun dan tentukan role dasar. Izin detail diatur dari menu Hak Akses.</p></div></div>
-    <div class="section-grid"><div class="card"><h3>Tambah pengguna</h3><form id="user-form"><div class="field"><label>Nama</label><input id="new-name" required></div><div class="field"><label>Username</label><input id="new-username" required></div><div class="field"><label>Password awal</label><input id="new-password" type="password" minlength="8" required></div><div class="field"><label>Role dasar</label><select id="new-role"><option value="STAFF">Staff</option><option value="SPV">Supervisor</option><option value="SUPER_USER">Super User</option></select></div><button class="btn btn-primary" type="submit">Simpan pengguna</button></form></div>
+    <div class="page-head"><div><h2>Pengguna</h2><p>${accessEnabled ? 'Staff dan SPV dikelola melalui AXINDO Access. Akun lokal hanya untuk Super User darurat.' : 'Buat akun dan tentukan role dasar. Izin detail diatur dari menu Hak Akses.'}</p></div></div>
+    <div class="section-grid"><div class="card"><h3>${accessEnabled ? 'Tambah Super User darurat' : 'Tambah pengguna'}</h3><form id="user-form"><div class="field"><label>Nama</label><input id="new-name" required></div><div class="field"><label>Username</label><input id="new-username" required></div><div class="field"><label>Email AXINDO ID</label><input id="new-email" type="email" placeholder="nama@axindo-network.id"></div><div class="field"><label>Password awal</label><input id="new-password" type="password" minlength="8" required></div><div class="field"><label>Role dasar</label><select id="new-role">${accessEnabled ? '<option value="SUPER_USER">Super User</option>' : '<option value="STAFF">Staff</option><option value="SPV">Supervisor</option><option value="SUPER_USER">Super User</option>'}</select></div><button class="btn btn-primary" type="submit">Simpan pengguna</button></form>${accessEnabled ? '<div class="notice"><strong>Penautan data lama:</strong> isi email AXINDO ID pada pengguna lokal lama. Saat login AXINDO ID pertama, akun akan ditautkan ke user yang sama sehingga riwayat transaksi tidak berpindah.</div>' : ''}</div>
     <div class="card"><h3>Daftar pengguna</h3>${userTable(data.users)}</div></div>`;
   document.getElementById('user-form').addEventListener('submit', createUser);
   document.querySelectorAll('[data-user-role]').forEach(select => select.addEventListener('change', () => updateUser(select.dataset.userRole, { role: select.value })));
@@ -827,10 +994,17 @@ async function renderUsers() {
     const pin = prompt('Masukkan PIN approval unik sebanyak 8 digit:');
     if (pin) setUserApprovalPin(button.dataset.userPin, pin);
   }));
+  document.querySelectorAll('[data-user-email]').forEach(button => button.addEventListener('click', () => {
+    const email = prompt('Masukkan email AXINDO ID pengguna:', button.dataset.currentEmail || '');
+    if (email !== null) updateUser(button.dataset.userEmail, { email });
+  }));
 }
 
 function userTable(users) {
-  return `<div class="table-wrap"><table><thead><tr><th>Nama</th><th>Username</th><th>Role</th><th>PIN Approval</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${users.map(user => `<tr><td><strong>${escapeHtml(user.name)}</strong></td><td>${escapeHtml(user.username)}</td><td><select data-user-role="${escapeHtml(user.userId)}"><option value="STAFF" ${user.role === 'STAFF' ? 'selected' : ''}>Staff</option><option value="SPV" ${user.role === 'SPV' ? 'selected' : ''}>Supervisor</option><option value="SUPER_USER" ${user.role === 'SUPER_USER' ? 'selected' : ''}>Super User</option></select></td><td>${(user.permissions || []).includes('approvals.decide') ? `<button class="btn btn-sm" data-user-pin="${escapeHtml(user.userId)}">${user.hasApprovalPin ? 'Reset PIN' : 'Buat PIN'}</button>` : '-'}</td><td>${statusHtml(user.active ? 'ACTIVE' : 'INACTIVE')}</td><td><div class="actions"><button class="btn btn-sm" data-user-password="${escapeHtml(user.userId)}">Reset password</button><button class="btn btn-sm" data-user-active="${escapeHtml(user.userId)}" data-next-active="${!user.active}" ${user.userId === state.user.userId ? 'disabled' : ''}>${user.active ? 'Nonaktifkan' : 'Aktifkan'}</button></div></td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Nama</th><th>Username / Email</th><th>Sumber</th><th>Role</th><th>PIN Approval</th><th>Status</th><th>Aksi</th></tr></thead><tbody>${users.map(user => {
+    const managed = user.authSource === 'ACCESS';
+    return `<tr><td><strong>${escapeHtml(user.name)}</strong></td><td>${escapeHtml(user.username)}<br><span class="muted">${escapeHtml(user.email || 'Email belum diisi')}</span></td><td>${managed ? 'AXINDO ID' : 'Lokal'}</td><td><select data-user-role="${escapeHtml(user.userId)}" ${managed ? 'disabled title="Role dikelola melalui AXINDO Access"' : ''}><option value="STAFF" ${user.role === 'STAFF' ? 'selected' : ''}>Staff</option><option value="SPV" ${user.role === 'SPV' ? 'selected' : ''}>Supervisor</option><option value="SUPER_USER" ${user.role === 'SUPER_USER' ? 'selected' : ''}>Super User</option></select></td><td>${(user.permissions || []).includes('approvals.decide') ? `<button class="btn btn-sm" data-user-pin="${escapeHtml(user.userId)}">${user.hasApprovalPin ? 'Reset PIN' : 'Buat PIN'}</button>` : '-'}</td><td>${statusHtml(user.active ? 'ACTIVE' : 'INACTIVE')}</td><td><div class="actions">${managed ? '' : `<button class="btn btn-sm" data-user-email="${escapeHtml(user.userId)}" data-current-email="${escapeHtml(user.email || '')}">Atur email AXINDO ID</button><button class="btn btn-sm" data-user-password="${escapeHtml(user.userId)}">Reset password</button>`}<button class="btn btn-sm" data-user-active="${escapeHtml(user.userId)}" data-next-active="${!user.active}" ${user.userId === state.user.userId ? 'disabled' : ''}>${user.active ? 'Nonaktifkan' : 'Aktifkan'}</button></div></td></tr>`;
+  }).join('')}</tbody></table></div>`;
 }
 
 async function setUserApprovalPin(userId, pin) {
@@ -843,7 +1017,7 @@ async function setUserApprovalPin(userId, pin) {
 async function createUser(event) {
   event.preventDefault(); setLoading(true);
   try {
-    await api('/api/admin/users', { method: 'POST', body: { name: value('new-name'), username: value('new-username'), password: value('new-password'), role: value('new-role') } });
+    await api('/api/admin/users', { method: 'POST', body: { name: value('new-name'), username: value('new-username'), email: value('new-email'), password: value('new-password'), role: value('new-role') } });
     toast('Pengguna berhasil dibuat.'); await renderUsers();
   } catch (error) { toast(error.message, true); } finally { setLoading(false); }
 }
@@ -1116,8 +1290,13 @@ function auditTable(rows) {
 }
 
 function renderProfile() {
+  if (isAccessUser()) {
+    const accessUrl = state.config?.auth?.accessPortalUrl || 'https://akses.axindo.my.id';
+    document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Keamanan Akun</h2><p>Identitas akun dikelola terpusat melalui AXINDO ID.</p></div></div><div class="section-grid"><div class="card"><h3>Password dikelola melalui AXINDO Access</h3><p class="muted">Password AXINDO ID tidak disimpan dan tidak dapat diubah dari aplikasi Kas Kecil.</p><a class="btn btn-primary" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener">Buka AXINDO Access</a></div>${has('approvals.decide') ? '<div class="card"><h3>PIN Approval</h3><p class="muted">Untuk keamanan, PIN approval akun AXINDO ID ditetapkan atau direset oleh Super User Kas Kecil melalui menu Pengguna.</p></div>' : ''}</div>`;
+    return;
+  }
   document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Keamanan Akun</h2><p>Kelola password dan PIN approval Anda.</p></div></div><div class="section-grid"><div class="card"><h3>Ubah Password</h3><form id="password-form"><div class="field"><label>Password lama</label><input id="old-password" type="password" required></div><div class="field"><label>Password baru</label><input id="new-password-profile" type="password" minlength="8" required></div><div class="field"><label>Ulangi password baru</label><input id="confirm-password" type="password" minlength="8" required></div><button class="btn btn-primary" type="submit">Ubah password</button></form></div>${has('approvals.decide') ? `<div class="card"><h3>PIN Approval</h3><p class="muted">PIN harus unik dan terdiri dari tepat 8 digit angka.</p><form id="pin-form"><div class="field"><label>Password saat ini</label><input id="pin-current-password" type="password" required></div><div class="field"><label>PIN baru</label><input id="profile-pin" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><div class="field"><label>Ulangi PIN</label><input id="profile-pin-confirm" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><button class="btn btn-primary" type="submit">Simpan PIN</button></form></div>` : ''}</div>`;
-  document.getElementById('password-form').addEventListener('submit', changePassword);
+  document.getElementById('password-form')?.addEventListener('submit', changePassword);
   const pinForm = document.getElementById('pin-form'); if (pinForm) pinForm.addEventListener('submit', changeApprovalPin);
 }
 
@@ -1155,6 +1334,7 @@ async function loadPublicConfig() {
     const config = await api('/api/public/config');
     state.config = { ...state.config, ...config };
     applyBranding(state.config);
+    configureAccessLogin(state.config.auth || {});
   } catch (ignored) {}
 }
 
@@ -1283,7 +1463,7 @@ function text(id, content) { document.getElementById(id).textContent = content |
 function empty(message) { return `<div class="empty">${escapeHtml(message)}</div>`; }
 function escapeHtml(value) { return String(value == null ? '' : value).replace(/[&<>'"]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]); }
 
-function showLogin() { document.getElementById('public-approval-view').classList.add('hidden'); document.getElementById('login-view').classList.remove('hidden'); document.getElementById('app-view').classList.add('hidden'); }
+function showLogin() { document.getElementById('public-approval-view').classList.add('hidden'); document.getElementById('login-view').classList.remove('hidden'); document.getElementById('app-view').classList.add('hidden'); configureAccessLogin(state.config?.auth || {}); }
 function showApp() { document.getElementById('public-approval-view').classList.add('hidden'); document.getElementById('login-view').classList.add('hidden'); document.getElementById('app-view').classList.remove('hidden'); }
 function showPublicApproval() { document.getElementById('public-approval-view').classList.remove('hidden'); document.getElementById('login-view').classList.add('hidden'); document.getElementById('app-view').classList.add('hidden'); }
 function setLoading(active) { state.loadingCount = Math.max(0, state.loadingCount + (active ? 1 : -1)); document.getElementById('loading').classList.toggle('hidden', state.loadingCount === 0); }

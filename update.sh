@@ -3,16 +3,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker tidak ditemukan. Pastikan Docker dan Docker Compose aktif."
+if [ "$(id -u)" -ne 0 ]; then
+  echo "Jalankan updater sebagai root: sudo ./update.sh"
   exit 1
 fi
-
+if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+  echo "Docker Engine dan plugin Docker Compose wajib tersedia."
+  exit 1
+fi
 if [ ! -d .git ]; then
-  echo "Folder ini bukan hasil clone GitHub. Unduh rilis terbaru lalu salin source tanpa menimpa .env."
+  echo "Folder ini bukan clone GitHub. Clone repository private ke /opt/ainet-kas-kecil."
   exit 1
 fi
-
+if [ ! -f .env ]; then
+  echo "File .env tidak ditemukan. Jalankan install.sh terlebih dahulu."
+  exit 1
+fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "Ada perubahan source lokal. Commit atau simpan perubahan tersebut sebelum update."
   exit 1
@@ -21,35 +27,37 @@ fi
 echo "Membuat backup database sebelum update..."
 docker compose exec -T kas-kecil node -e "require('./src/db').backupDatabase().then(p=>console.log('Backup:',p)).catch(e=>{console.error(e);process.exit(1)})"
 
-current_branch="$(git branch --show-current)"
-if [ -z "$current_branch" ]; then
-  echo "Branch Git tidak terdeteksi. Pindah ke branch main terlebih dahulu."
-  exit 1
-fi
+git fetch origin main
+git switch main
+git pull --ff-only origin main
 
-git fetch origin "$current_branch"
-git pull --ff-only origin "$current_branch"
-
-if ! grep -q '^KAS_BESAR_INTEGRATION_KEY=' .env 2>/dev/null; then
-  if command -v openssl >/dev/null 2>&1; then
-    integration_key="$(openssl rand -hex 32)"
-  else
-    integration_key="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
-  fi
-  printf '\nKAS_BESAR_INTEGRATION_KEY=%s\n' "$integration_key" >> .env
-  chmod 600 .env
-  echo "Kas Besar integration key dibuat: $integration_key"
-  echo "Simpan key ini untuk konfigurasi AINET Kas Besar."
-fi
-
+data_root="$(sed -n 's/^DATA_ROOT=//p' .env | tail -n 1)"
+data_root="${data_root:-/srv/storage/axindo-kas-kecil}"
+case "$data_root" in
+  ""|"/"|"/srv"|"/srv/storage"|"/opt"|"/var"|"/var/lib")
+    echo "DATA_ROOT tidak aman: '$data_root'."
+    exit 1
+    ;;
+esac
+install -d -m 0750 -o 1000 -g 1000 \
+  "$data_root/database" "$data_root/uploads" "$data_root/backups"
 docker network inspect ainet-finance >/dev/null 2>&1 || docker network create ainet-finance >/dev/null
 
+docker compose config --quiet
 docker compose up -d --build --force-recreate
 
-app_port="$(sed -n 's/^APP_PORT=//p' .env 2>/dev/null | tail -n 1)"
+app_port="$(sed -n 's/^APP_PORT=//p' .env | tail -n 1)"
 app_port="${app_port:-8090}"
-echo "Update selesai. Aplikasi aktif di http://IP-SERVER:$app_port"
-echo "Service integrasi Kas Besar aktif pada network internal ainet-finance."
-echo "Versi aktif:"
-curl --fail --silent "http://127.0.0.1:$app_port/api/health" || true
-echo
+ready=false
+for _attempt in $(seq 1 30); do
+  if health="$(curl --fail --silent "http://127.0.0.1:$app_port/api/health")"; then
+    ready=true
+    echo "Update selesai: $health"
+    break
+  fi
+  sleep 2
+done
+if [ "$ready" != true ]; then
+  echo "Versi baru belum sehat. Periksa log dan gunakan commit sebelumnya untuk rollback."
+  exit 1
+fi

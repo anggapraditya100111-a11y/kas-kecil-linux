@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { PERMISSION_CATALOG, effectivePermissions } = require('./permissions');
 const { hashPassword, assertPassword, newId } = require('./security');
@@ -344,6 +345,12 @@ function initDatabase() {
   ensureColumn('users', 'approval_pin_hash', 'TEXT');
   ensureColumn('users', 'approval_pin_salt', 'TEXT');
   ensureColumn('users', 'approval_pin_fingerprint', 'TEXT');
+  ensureColumn('users', 'email', 'TEXT');
+  ensureColumn('users', 'auth_source', "TEXT NOT NULL DEFAULT 'LOCAL'");
+  ensureColumn('users', 'access_subject', 'TEXT');
+  ensureColumn('users', 'access_groups_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('users', 'access_last_sync_at', 'TEXT');
+  ensureColumn('sessions', 'auth_source', "TEXT NOT NULL DEFAULT 'LOCAL'");
   ensureColumn('transactions', 'cash_effect', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn('transactions', 'source_type', "TEXT NOT NULL DEFAULT 'DIRECT'");
   ensureColumn('transactions', 'source_id', 'TEXT');
@@ -352,6 +359,10 @@ function initDatabase() {
   ensureColumn('transactions', 'underlying_path', 'TEXT');
   ensureColumn('transactions', 'underlying_original_name', 'TEXT');
   ensureColumn('transactions', 'underlying_mime', 'TEXT');
+  db.exec("UPDATE users SET auth_source='LOCAL' WHERE auth_source IS NULL OR auth_source='';");
+  db.exec("UPDATE sessions SET auth_source='LOCAL' WHERE auth_source IS NULL OR auth_source='';");
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_access_subject ON users(access_subject) WHERE access_subject IS NOT NULL;');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE) WHERE email IS NOT NULL AND email <> \'\';');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_approval_pin_fingerprint ON users(approval_pin_fingerprint) WHERE approval_pin_fingerprint IS NOT NULL;');
 
   const defaults = [
@@ -529,15 +540,78 @@ function setSetting(key, value, userId = 'SYSTEM') {
 }
 
 function publicUser(user) {
+  const authSource = user.auth_source || user.authSource || 'LOCAL';
   return {
     userId: user.id,
     name: user.name,
     username: user.username,
+    email: user.email || '',
     role: user.role,
     active: Boolean(user.active),
     hasApprovalPin: Boolean(user.approval_pin_hash),
-    lastLogin: user.last_login || ''
+    lastLogin: user.last_login || '',
+    authSource,
+    canChangePassword: authSource === 'LOCAL'
   };
+}
+
+function accessUsername(identity) {
+  const subject = String(identity.subject || '').trim();
+  const raw = String(identity.username || identity.email?.split('@')[0] || 'axindo').trim().toLowerCase();
+  const base = raw.replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'axindo';
+  const existing = db.prepare('SELECT id FROM users WHERE username=? COLLATE NOCASE').get(base);
+  if (!existing) return base;
+  const suffix = crypto.createHash('sha256').update(subject).digest('hex').slice(0, 8);
+  return `${base.slice(0, 31)}-${suffix}`;
+}
+
+function upsertAccessUser(identity, groups, role) {
+  const subject = String(identity?.subject || '').trim();
+  const email = String(identity?.email || '').trim().toLowerCase();
+  const identityUsername = String(identity?.username || '').trim().toLowerCase();
+  const name = String(identity?.name || identityUsername || email || 'Pengguna AXINDO').trim().slice(0, 120);
+  if (!subject || !email) throw Object.assign(new Error('Identitas AXINDO ID tidak lengkap.'), { status: 403 });
+  if (!['STAFF', 'SPV', 'SUPER_USER'].includes(role)) throw Object.assign(new Error('Role AXINDO ID untuk Kas Kecil tidak valid.'), { status: 403 });
+
+  const now = nowIso();
+  const groupsJson = JSON.stringify(Array.isArray(groups) ? groups : []);
+  let user = db.prepare("SELECT * FROM users WHERE auth_source='ACCESS' AND access_subject=?").get(subject);
+  if (user) {
+    if (!user.active) throw Object.assign(new Error('Akun Kas Kecil dinonaktifkan.'), { status: 403 });
+    db.prepare(`UPDATE users SET name=?,email=?,role=?,access_groups_json=?,access_last_sync_at=?,updated_at=? WHERE id=?`)
+      .run(name, email, role, groupsJson, now, now, user.id);
+    return publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id));
+  }
+
+  const linkCandidates = db.prepare(`SELECT * FROM users
+    WHERE COALESCE(auth_source,'LOCAL')='LOCAL' AND role<>'SUPER_USER'
+      AND ((email IS NOT NULL AND LOWER(email)=?) OR LOWER(username)=? OR LOWER(username)=?)`)
+    .all(email, identityUsername, email);
+  const uniqueCandidates = [...new Map(linkCandidates.map(item => [item.id, item])).values()];
+  if (uniqueCandidates.length > 1) {
+    throw Object.assign(new Error('AXINDO ID cocok dengan lebih dari satu pengguna Kas Kecil. Rapikan email pengguna terlebih dahulu.'), { status: 409 });
+  }
+  if (uniqueCandidates.length === 1) {
+    user = uniqueCandidates[0];
+    if (!user.active) throw Object.assign(new Error('Akun Kas Kecil dinonaktifkan.'), { status: 403 });
+    db.prepare(`UPDATE users SET name=?,email=?,role=?,auth_source='ACCESS',access_subject=?,access_groups_json=?,access_last_sync_at=?,updated_at=? WHERE id=?`)
+      .run(name, email, role, subject, groupsJson, now, now, user.id);
+    audit(user.id, 'LINK_ACCESS_ID', 'USER', user.id, { authSource: 'LOCAL' }, { authSource: 'ACCESS', email, role }, 'Pengguna lama ditautkan ke AXINDO ID');
+    return publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(user.id));
+  }
+
+  const id = newId('USR');
+  const username = accessUsername(identity);
+  const passwordData = hashPassword(`AxindoAccess-${crypto.randomBytes(32).toString('base64url')}`);
+  db.prepare(`INSERT INTO users(
+    id,name,username,email,password_hash,password_salt,role,active,created_at,updated_at,
+    auth_source,access_subject,access_groups_json,access_last_sync_at
+  ) VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?)`).run(
+    id, name, username, email, passwordData.hash, passwordData.salt, role, now, now,
+    'ACCESS', subject, groupsJson, now
+  );
+  audit(id, 'CREATE_ACCESS_USER', 'USER', id, '', { email, role }, 'Pengguna dibuat melalui AXINDO Access');
+  return publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(id));
 }
 
 function getUserPermissions(userId, role) {
@@ -617,6 +691,7 @@ module.exports = {
   getSetting,
   setSetting,
   publicUser,
+  upsertAccessUser,
   getUserPermissions,
   audit,
   cleanupExpiredSessions,

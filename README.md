@@ -2,6 +2,12 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.7.0
+
+- Fondasi autentikasi terpusat tersedia sebagai modul opsional dan tetap nonaktif pada paket publik.
+- Migrasi database mempertahankan kompatibilitas data dari versi sebelumnya.
+- Installer, updater, health check, dan paket Docker Linux diperbarui.
+
 ## Perbaikan versi 1.6.0
 
 - API autentikasi khusus aplikasi Android ditambahkan melalui Bearer token.

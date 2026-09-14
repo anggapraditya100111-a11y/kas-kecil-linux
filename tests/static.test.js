@@ -10,6 +10,7 @@ const client = fs.readFileSync('public/app.js', 'utf8');
 const styles = fs.readFileSync('public/styles.css', 'utf8');
 const compose = fs.readFileSync('docker-compose.yml', 'utf8');
 const server = fs.readFileSync('src/server.js', 'utf8');
+const accessSource = fs.readFileSync('src/access.js', 'utf8');
 const isPrivateSource = fs.existsSync('docker-compose.public.yml');
 const publicCompose = fs.readFileSync(isPrivateSource ? 'docker-compose.public.yml' : 'docker-compose.yml', 'utf8');
 const publicEnv = fs.readFileSync(isPrivateSource ? '.env.public.example' : '.env.example', 'utf8');
@@ -48,9 +49,10 @@ test('workflow keuangan v1.1 terhubung di client', () => {
 
 test('compose memasang semua persistent volume dan healthcheck', () => {
   if (isPrivateSource) {
-    for (const persistentPath of ['/DATA/AppData/kas-kecil/database', '/DATA/AppData/kas-kecil/uploads', '/DATA/AppData/kas-kecil/backups']) {
-      assert.match(compose, new RegExp(persistentPath.replaceAll('/', '\\/')));
-    }
+    assert.match(compose, /\$\{DATA_ROOT:-\/srv\/storage\/axindo-kas-kecil\}/);
+    for (const mount of ['/database:/app/data', '/uploads:/app/uploads', '/backups:/app/backups']) assert.match(compose, new RegExp(mount.replaceAll('/', '\\/')));
+    assert.match(compose, /ACCESS_HANDOFF_ENABLED/);
+    assert.match(compose, /host\.docker\.internal:host-gateway/);
   } else {
     assert.match(compose, /\$\{DATA_ROOT:-\/var\/lib\/kas-kecil\}\/database/);
     assert.match(compose, /\$\{DATA_ROOT:-\/var\/lib\/kas-kecil\}\/uploads/);
@@ -174,11 +176,22 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.6\.0/);
-  assert.match(html, /app\.js\?v=1\.6\.0/);
+  assert.match(html, /styles\.css\?v=1\.7\.0/);
+  assert.match(html, /app\.js\?v=1\.7\.0/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
+});
+
+test('login web mengikuti blueprint AXINDO Access', () => {
+  assert.match(html, /id="access-login-button"/);
+  assert.match(client, /code_challenge_method/);
+  assert.match(client, /axindo-access-handoff/);
+  assert.match(client, /sessionStorage/);
+  assert.match(server, /same-origin-allow-popups/);
+  assert.match(accessSource, /api\/auth\/access\/complete/);
+  assert.match(accessSource, /LOCAL_SUPER_USER_LOGIN_ENABLED/);
+  assert.match(server, /Password AXINDO ID dikelola/);
 });
 
 test('paket Linux publik memakai branding dan lokasi data generik', () => {
