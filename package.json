@@ -1,6 +1,6 @@
 {
   "name": "kas-kecil",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "description": "Aplikasi kas kecil berbasis web untuk Ubuntu dan Linux",
   "main": "src/server.js",

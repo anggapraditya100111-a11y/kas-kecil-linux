@@ -1,5 +1,5 @@
 Kas Kecil untuk Ubuntu dan Linux
-Versi: 1.7.0
+Versi: 1.7.1
 Tanggal: 2026-09-14
 Arsitektur: amd64
 Port default: 8090

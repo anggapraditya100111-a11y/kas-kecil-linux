@@ -105,6 +105,20 @@ test('branding, warna tema, dark mode, dan navigasi mobile tersedia', () => {
   assert.match(client, /nav-group-toggle/);
   assert.match(html, /Create By Apraditya/);
   assert.match(html, /id="sidebar-version"/);
+  assert.match(html, /id="mobile-bottom-nav"/);
+  assert.match(html, /data-mobile-page="dashboard"/);
+  assert.match(html, /data-mobile-page="mutations"/);
+  assert.match(html, /data-mobile-page="activity"/);
+  assert.match(html, /data-mobile-page="profile"/);
+  assert.match(html, /id="mobile-transaction-button"/);
+  assert.match(client, /mobileTransactionActions/);
+  assert.match(client, /mobile-balance-value/);
+  assert.match(client, /Rp ••••••••/);
+  assert.match(client, /function renderActivity/);
+  assert.match(client, /mobileAccountPanel/);
+  assert.match(styles, /@media \(max-width:720px\)/);
+  assert.match(styles, /\.mobile-bottom-nav/);
+  assert.match(styles, /\.mobile-home-hero/);
 });
 
 test('bukti dapat dipilih dari kamera perangkat', () => {
@@ -176,8 +190,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.7\.0/);
-  assert.match(html, /app\.js\?v=1\.7\.0/);
+  assert.match(html, /styles\.css\?v=1\.7\.1/);
+  assert.match(html, /app\.js\?v=1\.7\.1/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
@@ -259,4 +273,11 @@ test('akun kas dapat diedit dan diekspor ke Excel oleh Super User', () => {
   assert.match(server, /app\.get\('\/api\/admin\/accounts\.xlsx'/);
   assert.match(server, /requirePermission\('accounts\.manage'\)/);
   assert.match(server, /EXPORT_ACCOUNTS_XLSX/);
+});
+
+
+test('domain produksi Ubuntu memakai kaskecil.axindo.my.id dan Android tidak disentuh', () => {
+  assert.match(compose, /https:\/\/kaskecil\.axindo\.my\.id/);
+  assert.match(accessSource, /https:\/\/kaskecil\.axindo\.my\.id/);
+  assert.doesNotMatch(compose + accessSource, /https:\/\/kas\.axindo\.my\.id/);
 });

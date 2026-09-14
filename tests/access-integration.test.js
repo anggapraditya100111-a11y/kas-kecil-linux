@@ -10,7 +10,7 @@ process.env.BACKUP_DIR = path.join(runtime, 'backups');
 process.env.APP_PEPPER = 'access-test-pepper-1234567890';
 process.env.INITIAL_ADMIN_PASSWORD = 'AdminAccess123';
 process.env.ACCESS_HANDOFF_ENABLED = 'true';
-process.env.PUBLIC_APP_URL = 'https://kas.axindo.my.id';
+process.env.PUBLIC_APP_URL = 'https://kaskecil.axindo.my.id';
 process.env.ACCESS_PORTAL_URL = 'https://akses.axindo.my.id';
 process.env.ACCESS_PORTAL_INTERNAL_URL = 'http://host.docker.internal:8096';
 
@@ -23,7 +23,7 @@ test.after(() => fs.rmSync(runtime, { recursive: true, force: true }));
 test('manifest Kas Kecil memakai slug, URL, dan grup AXINDO yang stabil', () => {
   const manifest = access.manifest();
   assert.equal(manifest.id, 'kas-kecil');
-  assert.equal(manifest.url, 'https://kas.axindo.my.id');
+  assert.equal(manifest.url, 'https://kaskecil.axindo.my.id');
   assert.deepEqual(manifest.roles.map(item => item.group), [
     'AXINDO - KAS KECIL - SUPER USER',
     'AXINDO - KAS KECIL - SPV',

@@ -53,7 +53,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.7.1';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';

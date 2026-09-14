@@ -14,6 +14,8 @@ const state = {
   umoCanManage: false,
   pendingCorrectionTransactionId: '',
   pendingCorrectionReason: '',
+  pendingTransactionType: '',
+  mobileActivityRows: [],
   accessPopup: null
 };
 
@@ -27,6 +29,7 @@ const pages = [
   { id: 'corrections', label: 'Koreksi Transaksi', group: 'Utama', any: ['corrections.create', 'corrections.view_all'] },
   { id: 'approval', label: 'Approval', group: 'Utama', any: ['approvals.view'], badge: true },
   { id: 'mutations', label: 'Mutasi Kas', group: 'Laporan', any: ['mutations.view_self', 'mutations.view_all'] },
+  { id: 'activity', label: 'Aktivitas', group: 'Mobile', any: ['ledger.view_self', 'ledger.view_all', 'approvals.view'], mobileOnly: true },
   { id: 'account-summary', label: 'Rekap Dana per Akun', group: 'Laporan', any: ['account_summary.view'] },
   { id: 'account-comparison', label: 'Perbandingan Dana per Akun', group: 'Laporan', any: ['account_comparison.view'] },
   { id: 'account-list', label: 'Daftar Akun', group: 'Laporan', any: ['accounts.view'] },
@@ -48,6 +51,10 @@ document.getElementById('modal-close').addEventListener('click', closeModal);
 document.getElementById('modal').addEventListener('click', event => { if (event.target.id === 'modal') closeModal(); });
 document.getElementById('menu-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));
 document.getElementById('nav-backdrop').addEventListener('click', closeMobileNavigation);
+document.querySelectorAll('[data-mobile-page]').forEach(button => button.addEventListener('click', () => openPage(button.dataset.mobilePage)));
+document.getElementById('mobile-transaction-button')?.addEventListener('click', openMobileTransactionChooser);
+document.getElementById('mobile-activity-shortcut')?.addEventListener('click', () => allowedPage('activity') ? openPage('activity') : toast('Menu aktivitas tidak tersedia untuk akun ini.', true));
+document.getElementById('mobile-profile-shortcut')?.addEventListener('click', () => openPage('profile'));
 document.querySelectorAll('.theme-toggle').forEach(button => button.addEventListener('click', toggleTheme));
 document.addEventListener('input', event => {
   if (event.target.matches('.money-input')) event.target.value = formatMoneyInput(event.target.value);
@@ -347,7 +354,13 @@ async function bootstrap() {
   text('company-name', state.config.companyName);
   text('user-name', state.user.name);
   text('user-role', roleLabel(state.user.role));
+  text('user-initial', String(state.user.name || 'A').trim().charAt(0).toUpperCase() || 'A');
   text('sidebar-version', `Versi ${state.config.appVersion || '-'}`);
+  const mobileApprovalBadge = document.getElementById('mobile-approval-count');
+  if (mobileApprovalBadge) {
+    mobileApprovalBadge.textContent = state.approvalCount > 9 ? '9+' : String(state.approvalCount || '');
+    mobileApprovalBadge.classList.toggle('hidden', state.approvalCount < 1);
+  }
   applyBranding(state.config);
   renderNavigation();
 }
@@ -360,7 +373,7 @@ function allowedPage(pageId) {
 function firstAllowedPage() { return pages.find(page => allowedPage(page.id)).id; }
 
 function renderNavigation() {
-  const visible = pages.filter(page => allowedPage(page.id));
+  const visible = pages.filter(page => !page.mobileOnly && allowedPage(page.id));
   const grouped = visible.reduce((groups, page) => {
     if (!groups.has(page.group)) groups.set(page.group, []);
     groups.get(page.group).push(page);
@@ -387,15 +400,76 @@ function renderNavigation() {
     renderNavigation();
   }));
   nav.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => { closeMobileNavigation(); openPage(button.dataset.page); }));
+  renderMobileNavigation();
+}
+
+function renderMobileNavigation() {
+  const aliases = {
+    dashboard: ['dashboard'],
+    mutations: ['mutations'],
+    activity: ['activity', 'ledger', 'approval'],
+    profile: ['profile', 'budget', 'account-list', 'account-summary', 'account-comparison', 'users', 'access', 'accounts', 'settings', 'database', 'audit']
+  };
+  document.querySelectorAll('[data-mobile-page]').forEach(button => {
+    const target = button.dataset.mobilePage;
+    button.hidden = !allowedPage(target);
+    button.classList.toggle('active', (aliases[target] || [target]).includes(state.currentPage));
+  });
+  const transactionPages = ['transaction', 'transfers', 'umo', 'corrections'];
+  const transactionButton = document.getElementById('mobile-transaction-button');
+  if (transactionButton) {
+    const available = has('transactions.create') || has('transfers.create') || has('umo.create') || has('corrections.create');
+    transactionButton.hidden = !available;
+    transactionButton.classList.toggle('active', transactionPages.includes(state.currentPage));
+  }
+}
+
+function mobileIcon(name) {
+  const paths = {
+    expense: '<path d="M7 7h10v10H7zM4 20 20 4M13 4h7v7"/>',
+    income: '<path d="M17 17H7V7h10zM11 20H4v-7M20 4 4 20"/>',
+    umo: '<path d="M3 7h18v13H3zM3 10h18M16 15h2M7 7V5h10v2"/>',
+    transfer: '<path d="m7 7-4 4 4 4M3 11h14M17 17l4-4-4-4M21 13H7"/>',
+    mutations: '<path d="M7 3h10v18l-2-1-3 1.5L9 20l-2 1zM9 8h6M9 12h6M9 16h4"/>',
+    correction: '<path d="m4 16 9-9 4 4-9 9H4zM14 6l2-2 4 4-2 2"/>',
+    account: '<path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10"/>'
+  };
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.account}</svg>`;
+}
+
+function mobileTransactionActions() {
+  const actions = [];
+  if (has('transactions.create')) {
+    actions.push({ target: 'transaction', type: 'KELUAR', label: 'Pengeluaran', description: 'Catat pembayaran atau biaya kas kecil', icon: 'expense' });
+    actions.push({ target: 'transaction', type: 'MASUK', label: 'Kas Masuk', description: 'Catat penerimaan kas', icon: 'income' });
+  }
+  if (has('umo.create')) actions.push({ target: 'umo', label: 'Uang Muka Operasional', description: 'Pencairan dan pertanggungjawaban UMO', icon: 'umo' });
+  if (has('transfers.create')) actions.push({ target: 'transfers', label: 'Transfer Kas', description: 'Kirim kas kepada staff lain', icon: 'transfer' });
+  if (has('corrections.create')) actions.push({ target: 'corrections', label: 'Koreksi', description: 'Reversal atau penggantian transaksi', icon: 'correction' });
+  return actions;
+}
+
+function openMobileTransactionChooser() {
+  const actions = mobileTransactionActions();
+  if (!actions.length) return toast('Tidak ada transaksi yang diizinkan untuk akun ini.', true);
+  openModal(`<div class="mobile-transaction-sheet"><div class="mobile-sheet-handle"></div><h2>Buat Transaksi</h2><p class="muted">Pilih jenis transaksi yang akan dicatat.</p><div class="mobile-sheet-list">${actions.map(action => `<button type="button" class="mobile-sheet-action" data-mobile-target="${escapeHtml(action.target)}" data-mobile-type="${escapeHtml(action.type || '')}"><span class="mobile-sheet-icon">${mobileIcon(action.icon)}</span><span><strong>${escapeHtml(action.label)}</strong><small>${escapeHtml(action.description)}</small></span><span class="mobile-chevron">›</span></button>`).join('')}</div></div>`);
+  document.querySelectorAll('[data-mobile-target]').forEach(button => button.addEventListener('click', () => {
+    const target = button.dataset.mobileTarget;
+    state.pendingTransactionType = button.dataset.mobileType || '';
+    closeModal();
+    openPage(target);
+  }));
 }
 
 async function openPage(pageId) {
   if (!allowedPage(pageId)) return toast('Anda tidak memiliki akses ke menu tersebut.', true);
   state.currentPage = pageId;
+  document.body.classList.toggle('mobile-home-active', pageId === 'dashboard');
+  renderMobileNavigation();
   const activePage = pages.find(page => page.id === pageId);
   if (activePage) state.openGroups.add(activePage.group);
   renderNavigation();
-  const renderers = { dashboard: renderDashboard, transaction: renderTransaction, ledger: renderLedger, mutations: renderMutations,
+  const renderers = { dashboard: renderDashboard, transaction: renderTransaction, ledger: renderLedger, mutations: renderMutations, activity: renderActivity,
     budget: renderBudget, 'account-list': renderAccountList, 'account-summary': renderAccountSummary, 'account-comparison': renderAccountComparison,
     transfers: renderTransfers, umo: renderUmo, corrections: renderCorrections,
     approval: renderApproval, users: renderUsers, access: renderAccess, accounts: renderAccounts, settings: renderSettings,
@@ -411,30 +485,71 @@ async function renderDashboard(userId = 'ALL', startDate = '', endDate = '') {
   [...query.keys()].forEach(key => { if (!query.get(key)) query.delete(key); });
   const data = await api(`/api/dashboard?${query}`);
   state.userOptions = data.userOptions || [];
+  state.mobileActivityRows = data.recent || [];
   const selector = data.canViewAll ? `
     <div class="field"><label for="dashboard-user">Tampilkan data</label><select id="dashboard-user"><option value="ALL">Seluruh pengguna</option>${data.userOptions.map(user => `<option value="${escapeHtml(user.userId)}" ${data.scope === user.userId ? 'selected' : ''}>${escapeHtml(user.name)} — ${escapeHtml(roleLabel(user.role))}</option>`).join('')}</select></div>` : '';
+  const quickCandidates = [
+    ...mobileTransactionActions().filter(action => action.type !== 'MASUK'),
+    ...(allowedPage('mutations') ? [{ target: 'mutations', label: 'Mutasi', description: 'Lihat arus kas', icon: 'mutations' }] : [])
+  ].slice(0, 4);
+  const quickActions = quickCandidates.map(action => `<button class="mobile-quick-action" type="button" data-mobile-quick="${escapeHtml(action.target)}" data-mobile-type="${escapeHtml(action.type || '')}"><span>${mobileIcon(action.icon)}</span><strong>${escapeHtml(action.label)}</strong></button>`).join('');
+  const latest = (data.recent || []).slice(0, 5).map((row, index) => mobileActivityCard(row, index)).join('');
   document.getElementById('page').innerHTML = `
-    <div class="page-head"><div><h2>Dashboard</h2><p>${data.canViewAll ? 'Ringkasan dapat dilihat seluruhnya atau difilter per pengguna.' : 'Ringkasan transaksi yang dibuat oleh akun Anda.'}</p></div></div>
-    <div class="card"><form id="dashboard-filter" class="grid-4">${selector}
-      <div class="field"><label for="dashboard-start">Dari tanggal</label><input id="dashboard-start" type="date" value="${escapeHtml(data.startDate)}"></div>
-      <div class="field"><label for="dashboard-end">Sampai tanggal</label><input id="dashboard-end" type="date" value="${escapeHtml(data.endDate)}"></div>
-      <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Terapkan</button></div>
-    </form></div>
-    <div class="grid-3">
-      <div class="card metric"><span>Saldo kas sampai ${escapeHtml(data.endDate)}</span><strong>${money(data.cashBalance)}</strong></div>
-      <div class="card metric pending"><span>UMO belum dipertanggungjawabkan</span><strong>${money(data.umoOutstanding)}</strong></div>
-      <div class="card metric in"><span>Kas masuk approved</span><strong>${money(data.totalIn)}</strong></div>
-      <div class="card metric out"><span>Kas keluar approved</span><strong>${money(data.totalOut)}</strong></div>
-      <div class="card metric pending"><span>Menunggu approval</span><strong>${data.pendingCount}</strong></div>
-      <div class="card metric"><span>Jumlah transaksi</span><strong>${data.transactionCount}</strong></div>
-    </div>
-    ${data.canViewAll ? `<div class="card"><h3>Ringkasan per pengguna</h3>${perUserTable(data.perUser)}</div>` : ''}
-    <div class="card"><h3>10 transaksi terbaru</h3>${transactionTable(data.recent || [], false)}</div>`;
+    <section class="mobile-home-hero">
+      <div class="mobile-welcome"><span>Selamat datang,</span><h2>${escapeHtml(state.user.name)}</h2><small>${escapeHtml(roleLabel(state.user.role))}</small></div>
+      <div id="mobile-balance-card" class="mobile-balance-card">
+        <div class="mobile-balance-title"><span>Saldo Kas Saya</span><button id="mobile-balance-toggle" type="button" aria-label="Lihat saldo"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12m10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18M10.5 5.2Q11.2 5 12 5c6 0 10 7 10 7a16 16 0 0 1-2.1 2.8M6.6 6.6C3.8 8.5 2 12 2 12s4 7 10 7c1.4 0 2.7-.4 3.8-1M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg></button></div>
+        <strong id="mobile-balance-value">Rp ••••••••</strong>
+        <small id="mobile-balance-hint">Ketuk ikon mata untuk melihat saldo</small>
+      </div>
+    </section>
+    <section class="mobile-dashboard-content">
+      ${quickActions ? `<div class="mobile-section-head"><h3>Aksi Cepat</h3></div><div class="mobile-quick-grid">${quickActions}</div>` : ''}
+      <div class="mobile-section-head"><h3>Tahap Berikut</h3>${state.approvalCount ? '<button type="button" data-mobile-open-activity>Lihat semua</button>' : ''}</div>
+      ${state.approvalCount
+        ? `<button type="button" class="mobile-info-card" data-mobile-open-approval><span class="mobile-info-icon">✓</span><span><strong>${state.approvalCount} menunggu tindakan</strong><small>Periksa detail sebelum memberi keputusan.</small></span><span>›</span></button>`
+        : '<div class="mobile-info-card static"><span class="mobile-info-icon success">✓</span><span><strong>Semua beres</strong><small>Tidak ada proses yang menunggu tindakan.</small></span></div>'}
+      <div class="mobile-section-head"><h3>Aktivitas Terbaru</h3>${allowedPage('activity') ? '<button type="button" data-mobile-open-activity>Lihat semua</button>' : ''}</div>
+      <div class="mobile-activity-list">${latest || '<div class="mobile-info-card static"><span><strong>Belum ada aktivitas</strong><small>Transaksi yang dicatat akan muncul di sini.</small></span></div>'}</div>
+    </section>
+    <div class="dashboard-desktop">
+      <div class="page-head"><div><h2>Dashboard</h2><p>${data.canViewAll ? 'Ringkasan dapat dilihat seluruhnya atau difilter per pengguna.' : 'Ringkasan transaksi yang dibuat oleh akun Anda.'}</p></div></div>
+      <div class="card"><form id="dashboard-filter" class="grid-4">${selector}
+        <div class="field"><label for="dashboard-start">Dari tanggal</label><input id="dashboard-start" type="date" value="${escapeHtml(data.startDate)}"></div>
+        <div class="field"><label for="dashboard-end">Sampai tanggal</label><input id="dashboard-end" type="date" value="${escapeHtml(data.endDate)}"></div>
+        <div class="field" style="align-self:end"><button class="btn btn-primary" type="submit">Terapkan</button></div>
+      </form></div>
+      <div class="grid-3">
+        <div class="card metric"><span>Saldo kas sampai ${escapeHtml(data.endDate)}</span><strong>${money(data.cashBalance)}</strong></div>
+        <div class="card metric pending"><span>UMO belum dipertanggungjawabkan</span><strong>${money(data.umoOutstanding)}</strong></div>
+        <div class="card metric in"><span>Kas masuk approved</span><strong>${money(data.totalIn)}</strong></div>
+        <div class="card metric out"><span>Kas keluar approved</span><strong>${money(data.totalOut)}</strong></div>
+        <div class="card metric pending"><span>Menunggu approval</span><strong>${data.pendingCount}</strong></div>
+        <div class="card metric"><span>Jumlah transaksi</span><strong>${data.transactionCount}</strong></div>
+      </div>
+      ${data.canViewAll ? `<div class="card"><h3>Ringkasan per pengguna</h3>${perUserTable(data.perUser)}</div>` : ''}
+      <div class="card"><h3>10 transaksi terbaru</h3>${transactionTable(data.recent || [], false)}</div>
+    </div>`;
   document.getElementById('dashboard-filter').addEventListener('submit', event => {
     event.preventDefault();
     const selectedUser = document.getElementById('dashboard-user') ? value('dashboard-user') : 'ALL';
     renderDashboard(selectedUser, value('dashboard-start'), value('dashboard-end')).catch(error => toast(error.message, true));
   });
+  let balanceVisible = false;
+  document.getElementById('mobile-balance-toggle')?.addEventListener('click', () => {
+    balanceVisible = !balanceVisible;
+    document.getElementById('mobile-balance-card')?.classList.toggle('balance-revealed', balanceVisible);
+    text('mobile-balance-value', balanceVisible ? money(data.cashBalance) : 'Rp ••••••••');
+    text('mobile-balance-hint', balanceVisible ? 'Saldo tersedia' : 'Ketuk ikon mata untuk melihat saldo');
+    document.getElementById('mobile-balance-toggle')?.setAttribute('aria-label', balanceVisible ? 'Sembunyikan saldo' : 'Lihat saldo');
+  });
+  document.querySelectorAll('[data-mobile-quick]').forEach(button => button.addEventListener('click', () => {
+    state.pendingTransactionType = button.dataset.mobileType || '';
+    openPage(button.dataset.mobileQuick);
+  }));
+  document.querySelectorAll('[data-mobile-open-activity]').forEach(button => button.addEventListener('click', () => openPage('activity')));
+  document.querySelector('[data-mobile-open-approval]')?.addEventListener('click', () => openPage('approval'));
+  bindMobileActivityCards();
 }
 
 function perUserTable(rows) {
@@ -544,6 +659,10 @@ function renderTransaction() {
       </form>
     </div>`;
   const type = document.getElementById('tx-type');
+  if (state.pendingTransactionType) {
+    type.value = state.pendingTransactionType;
+    state.pendingTransactionType = '';
+  }
   type.addEventListener('change', updateAccountOptions);
   document.getElementById('tx-account').addEventListener('change', updateTransactionAccountInfo);
   updateAccountOptions();
@@ -590,6 +709,51 @@ async function loadUserOptions() {
   if (state.userOptions.length) return state.userOptions;
   try { state.userOptions = (await api('/api/users/options')).users || []; } catch { state.userOptions = []; }
   return state.userOptions;
+}
+
+function mobileActivityCard(row, index) {
+  const outgoing = row.type === 'KELUAR';
+  return `<button type="button" class="mobile-activity-card" data-mobile-activity-index="${index}" data-activity-card-status="${escapeHtml(String(row.status || '').toUpperCase())}"><span class="mobile-activity-icon ${outgoing ? 'out' : 'in'}">${outgoing ? '↗' : '↙'}</span><span class="mobile-activity-copy"><strong>${escapeHtml(typeLabel(row.type || 'TRANSACTION'))}</strong><small>${escapeHtml(row.transactionNo || row.referenceNo || '-')} • ${escapeHtml(row.transactionDate || '-')}</small><small>${escapeHtml(row.description || row.accountName || '-')}</small></span><span class="mobile-activity-amount ${outgoing ? 'out' : 'in'}">${outgoing ? '-' : '+'}${money(row.amount)}<small>${escapeHtml(String(row.status || ''))}</small></span></button>`;
+}
+
+function bindMobileActivityCards(root = document) {
+  root.querySelectorAll('[data-mobile-activity-index]').forEach(button => button.addEventListener('click', () => {
+    const row = state.mobileActivityRows[Number(button.dataset.mobileActivityIndex)];
+    if (row) openMobileActivityDetail(row);
+  }));
+}
+
+function openMobileActivityDetail(row) {
+  const canReceipt = has('receipts.view_all') || has('receipts.view_self');
+  openModal(`<div class="mobile-activity-detail"><div class="mobile-sheet-handle"></div><span class="muted">${escapeHtml(row.transactionNo || row.referenceNo || '-')}</span><h2>${escapeHtml(typeLabel(row.type || 'TRANSACTION'))}</h2><div class="mobile-detail-grid"><div><small>Tanggal</small><strong>${escapeHtml(row.transactionDate || '-')}</strong></div><div><small>Status</small>${statusHtml(row.status)}</div><div><small>Akun</small><strong>${escapeHtml(row.accountName || '-')}</strong></div><div><small>Nominal</small><strong>${money(row.amount)}</strong></div></div><p><strong>Dibuat oleh</strong><br>${escapeHtml(row.createdByName || '-')}</p><p><strong>Pihak terkait</strong><br>${escapeHtml(row.counterparty || '-')}</p><p><strong>Keterangan</strong><br>${escapeHtml(row.description || '-')}</p><div class="actions">${canReceipt && row.receiptAvailable ? `<button class="btn btn-primary" data-receipt="${escapeHtml(row.transactionId)}">Lihat bukti</button>` : ''}${canReceipt && row.underlyingAvailable ? `<button class="btn btn-ghost" data-underlying="${escapeHtml(row.transactionId)}">Underlying</button>` : ''}${row.approvalId ? `<button class="btn btn-ghost" data-approval-link="${escapeHtml(row.approvalId)}">Salin link approval</button>` : ''}</div></div>`);
+  bindReceiptButtons();
+  bindApprovalLinkButtons();
+}
+
+async function renderActivity() {
+  const transactionPromise = has('ledger.view_self') || has('ledger.view_all') ? api('/api/ledger') : Promise.resolve({ rows: [] });
+  const approvalPromise = has('approvals.view') ? api('/api/approvals') : Promise.resolve({ rows: [] });
+  const [transactions, approvals] = await Promise.all([transactionPromise, approvalPromise]);
+  state.mobileActivityRows = transactions.rows || [];
+  const approvalNotice = (approvals.rows || []).length
+    ? `<button type="button" class="mobile-info-card activity-approval-card" data-mobile-open-approval><span class="mobile-info-icon">✓</span><span><strong>${approvals.rows.length} perlu tindakan</strong><small>Buka rincian approval sebelum memutuskan.</small></span><span>›</span></button>`
+    : '';
+  document.getElementById('page').innerHTML = `
+    <div class="mobile-page-title"><div><h2>Aktivitas</h2><p>Pantau transaksi dan tahap berikutnya</p></div><button class="mobile-refresh" type="button" data-mobile-refresh aria-label="Perbarui">↻</button></div>
+    ${approvalNotice}
+    <div class="mobile-filter-row">${[['ALL','Semua'],['PENDING','Menunggu'],['APPROVED','Disetujui'],['REJECTED','Ditolak']].map(([status,label]) => `<button type="button" data-activity-filter="${status}" class="${status === 'ALL' ? 'active' : ''}">${label}</button>`).join('')}</div>
+    <div id="mobile-activity-results" class="mobile-activity-list">${state.mobileActivityRows.length ? state.mobileActivityRows.map((row, index) => mobileActivityCard(row, index)).join('') : '<div class="mobile-info-card static"><span><strong>Belum ada aktivitas</strong><small>Aktivitas akun akan muncul di sini.</small></span></div>'}</div>`;
+  bindMobileActivityCards();
+  document.querySelector('[data-mobile-open-approval]')?.addEventListener('click', () => openPage('approval'));
+  document.querySelector('[data-mobile-refresh]')?.addEventListener('click', () => renderActivity().catch(error => toast(error.message, true)));
+  document.querySelectorAll('[data-activity-filter]').forEach(button => button.addEventListener('click', () => {
+    document.querySelectorAll('[data-activity-filter]').forEach(item => item.classList.toggle('active', item === button));
+    const filter = button.dataset.activityFilter;
+    document.querySelectorAll('[data-activity-card-status]').forEach(card => {
+      const status = card.dataset.activityCardStatus;
+      card.hidden = filter !== 'ALL' && (filter === 'PENDING' ? !['PENDING','OPEN','SETTLEMENT_PENDING'].includes(status) : status !== filter);
+    });
+  }));
 }
 
 async function renderLedger() {
@@ -1289,13 +1453,28 @@ function auditTable(rows) {
   return `<div class="table-wrap"><table><thead><tr><th>Waktu</th><th>Pengguna</th><th>Aksi</th><th>Entitas</th><th>Keterangan</th></tr></thead><tbody>${rows.map(row => `<tr><td>${escapeHtml(formatDateTime(row.timestamp))}</td><td>${escapeHtml(row.user_name || row.user_id || 'SYSTEM')}</td><td>${escapeHtml(row.action)}</td><td>${escapeHtml(row.entity_type)}<br><span class="muted">${escapeHtml(row.entity_id || '')}</span></td><td>${escapeHtml(row.description || '')}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
+function mobileAccountPanel() {
+  const roots = new Set(['dashboard', 'mutations', 'transaction', 'activity', 'profile']);
+  const features = pages.filter(page => !page.mobileOnly && !roots.has(page.id) && allowedPage(page.id));
+  return `<section class="mobile-account-panel"><div class="mobile-profile-card"><span class="mobile-profile-avatar">${escapeHtml(String(state.user.name || 'A').charAt(0).toUpperCase())}</span><div><h2>${escapeHtml(state.user.name)}</h2><p>${escapeHtml(roleLabel(state.user.role))}</p></div></div><div class="mobile-account-actions"><button type="button" data-mobile-theme>${document.documentElement.dataset.theme === 'dark' ? 'Mode terang' : 'Mode gelap'}</button><button type="button" data-mobile-logout>Keluar</button></div>${features.length ? `<div class="mobile-section-head"><h3>Fitur Saya</h3></div><div class="mobile-feature-list">${features.map(page => `<button type="button" data-mobile-feature="${escapeHtml(page.id)}"><span class="mobile-feature-icon">${mobileIcon(page.id === 'transfers' ? 'transfer' : page.id === 'umo' ? 'umo' : page.id === 'corrections' ? 'correction' : 'account')}</span><span><strong>${escapeHtml(page.label)}</strong><small>${escapeHtml(page.group)}</small></span><span>›</span></button>`).join('')}</div>` : ''}</section>`;
+}
+
+function bindMobileAccountPanel() {
+  document.querySelectorAll('[data-mobile-feature]').forEach(button => button.addEventListener('click', () => openPage(button.dataset.mobileFeature)));
+  document.querySelector('[data-mobile-theme]')?.addEventListener('click', () => { toggleTheme(); renderProfile(); });
+  document.querySelector('[data-mobile-logout]')?.addEventListener('click', logout);
+}
+
 function renderProfile() {
+  const mobilePanel = mobileAccountPanel();
   if (isAccessUser()) {
     const accessUrl = state.config?.auth?.accessPortalUrl || 'https://akses.axindo.my.id';
-    document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Keamanan Akun</h2><p>Identitas akun dikelola terpusat melalui AXINDO ID.</p></div></div><div class="section-grid"><div class="card"><h3>Password dikelola melalui AXINDO Access</h3><p class="muted">Password AXINDO ID tidak disimpan dan tidak dapat diubah dari aplikasi Kas Kecil.</p><a class="btn btn-primary" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener">Buka AXINDO Access</a></div>${has('approvals.decide') ? '<div class="card"><h3>PIN Approval</h3><p class="muted">Untuk keamanan, PIN approval akun AXINDO ID ditetapkan atau direset oleh Super User Kas Kecil melalui menu Pengguna.</p></div>' : ''}</div>`;
+    document.getElementById('page').innerHTML = `${mobilePanel}<div class="page-head"><div><h2>Keamanan Akun</h2><p>Identitas akun dikelola terpusat melalui AXINDO ID.</p></div></div><div class="section-grid"><div class="card"><h3>Password dikelola melalui AXINDO Access</h3><p class="muted">Password AXINDO ID tidak disimpan dan tidak dapat diubah dari aplikasi Kas Kecil.</p><a class="btn btn-primary" href="${escapeHtml(accessUrl)}" target="_blank" rel="noopener">Buka AXINDO Access</a></div>${has('approvals.decide') ? '<div class="card"><h3>PIN Approval</h3><p class="muted">Untuk keamanan, PIN approval akun AXINDO ID ditetapkan atau direset oleh Super User Kas Kecil melalui menu Pengguna.</p></div>' : ''}</div>`;
+    bindMobileAccountPanel();
     return;
   }
-  document.getElementById('page').innerHTML = `<div class="page-head"><div><h2>Keamanan Akun</h2><p>Kelola password dan PIN approval Anda.</p></div></div><div class="section-grid"><div class="card"><h3>Ubah Password</h3><form id="password-form"><div class="field"><label>Password lama</label><input id="old-password" type="password" required></div><div class="field"><label>Password baru</label><input id="new-password-profile" type="password" minlength="8" required></div><div class="field"><label>Ulangi password baru</label><input id="confirm-password" type="password" minlength="8" required></div><button class="btn btn-primary" type="submit">Ubah password</button></form></div>${has('approvals.decide') ? `<div class="card"><h3>PIN Approval</h3><p class="muted">PIN harus unik dan terdiri dari tepat 8 digit angka.</p><form id="pin-form"><div class="field"><label>Password saat ini</label><input id="pin-current-password" type="password" required></div><div class="field"><label>PIN baru</label><input id="profile-pin" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><div class="field"><label>Ulangi PIN</label><input id="profile-pin-confirm" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><button class="btn btn-primary" type="submit">Simpan PIN</button></form></div>` : ''}</div>`;
+  document.getElementById('page').innerHTML = `${mobilePanel}<div class="page-head"><div><h2>Keamanan Akun</h2><p>Kelola password dan PIN approval Anda.</p></div></div><div class="section-grid"><div class="card"><h3>Ubah Password</h3><form id="password-form"><div class="field"><label>Password lama</label><input id="old-password" type="password" required></div><div class="field"><label>Password baru</label><input id="new-password-profile" type="password" minlength="8" required></div><div class="field"><label>Ulangi password baru</label><input id="confirm-password" type="password" minlength="8" required></div><button class="btn btn-primary" type="submit">Ubah password</button></form></div>${has('approvals.decide') ? `<div class="card"><h3>PIN Approval</h3><p class="muted">PIN harus unik dan terdiri dari tepat 8 digit angka.</p><form id="pin-form"><div class="field"><label>Password saat ini</label><input id="pin-current-password" type="password" required></div><div class="field"><label>PIN baru</label><input id="profile-pin" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><div class="field"><label>Ulangi PIN</label><input id="profile-pin-confirm" type="password" inputmode="numeric" maxlength="8" pattern="[0-9]{8}" required></div><button class="btn btn-primary" type="submit">Simpan PIN</button></form></div>` : ''}</div>`;
+  bindMobileAccountPanel();
   document.getElementById('password-form')?.addEventListener('submit', changePassword);
   const pinForm = document.getElementById('pin-form'); if (pinForm) pinForm.addEventListener('submit', changeApprovalPin);
 }

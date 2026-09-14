@@ -2,6 +2,12 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.7.1
+
+- Tampilan web pada ponsel diperbarui menjadi antarmuka bergaya aplikasi dengan navigasi bawah lima menu.
+- Saldo Beranda tersamarkan saat halaman dibuka dan dapat ditampilkan melalui tombol mata.
+- Seluruh menu yang diizinkan tetap dapat dijangkau dari pusat fitur pada halaman Akun.
+
 ## Perbaikan versi 1.7.0
 
 - Fondasi autentikasi terpusat tersedia sebagai modul opsional dan tetap nonaktif pada paket publik.

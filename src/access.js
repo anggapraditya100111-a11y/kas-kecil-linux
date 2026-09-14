@@ -2,7 +2,7 @@ const ACCESS_APP_SLUG = 'kas-kecil';
 
 const enabled = String(process.env.ACCESS_HANDOFF_ENABLED || 'false').toLowerCase() === 'true';
 const localSuperUserEnabled = String(process.env.LOCAL_SUPER_USER_LOGIN_ENABLED || 'true').toLowerCase() === 'true';
-const publicAppUrl = String(process.env.PUBLIC_APP_URL || 'https://kas.axindo.my.id').replace(/\/$/, '');
+const publicAppUrl = String(process.env.PUBLIC_APP_URL || 'https://kaskecil.axindo.my.id').replace(/\/$/, '');
 const portalUrl = String(process.env.ACCESS_PORTAL_URL || 'https://akses.axindo.my.id').replace(/\/$/, '');
 const internalUrl = String(process.env.ACCESS_PORTAL_INTERNAL_URL || portalUrl).replace(/\/$/, '');
 
