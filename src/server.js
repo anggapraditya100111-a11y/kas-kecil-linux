@@ -53,7 +53,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.7.1';
+const APP_VERSION = '1.7.2';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -669,11 +669,13 @@ app.post('/api/mobile/auth/login', loginLimiter, (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post('/api/auth/logout', authMiddleware, (req, res) => {
+app.post('/api/auth/logout', authMiddleware, (req, res, next) => {
+  const scope = String(req.body?.scope || 'local').trim().toLowerCase();
+  if (!['local', 'axindo'].includes(scope)) return next(new AppError('Pilihan keluar tidak valid.'));
   db.prepare('UPDATE sessions SET revoked_at=? WHERE token_hash=?').run(nowIso(), req.auth.sessionHash);
-  audit(req.auth.user.id, 'LOGOUT', 'SESSION', '', '', '', 'Logout');
+  audit(req.auth.user.id, scope === 'axindo' ? 'LOGOUT_AXINDO' : 'LOGOUT', 'SESSION', '', '', '', scope === 'axindo' ? 'Logout Kas Kecil dan AXINDO Access' : 'Logout Kas Kecil');
   res.clearCookie(COOKIE_NAME, { path: '/' });
-  res.json({ ok: true });
+  res.json({ ok: true, scope, logoutUrl: scope === 'axindo' ? access.logoutUrl() : '' });
 });
 
 app.post('/api/mobile/auth/logout', authMiddleware, (req, res) => {

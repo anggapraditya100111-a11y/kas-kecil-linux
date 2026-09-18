@@ -32,6 +32,13 @@ test('manifest Kas Kecil memakai slug, URL, dan grup AXINDO yang stabil', () => 
   assert.equal(access.roleForGroups(['AXINDO - KAS KECIL - SPV']), 'SPV');
 });
 
+test('logout AXINDO kembali ke domain Kas Kecil melalui portal Access', () => {
+  const target = new URL(access.logoutUrl());
+  assert.equal(target.origin, 'https://akses.axindo.my.id');
+  assert.equal(target.pathname, '/logout');
+  assert.equal(new URL(target.searchParams.get('return_to')).href, 'https://kaskecil.axindo.my.id/?logout=axindo');
+});
+
 test('handoff menukar code secara backend dengan audience Kas Kecil', async () => {
   let request;
   const result = await access.exchangeHandoff('A'.repeat(40), 'v'.repeat(43), async (url, options) => {

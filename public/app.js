@@ -46,7 +46,7 @@ document.addEventListener('DOMContentLoaded', init);
 document.getElementById('login-form').addEventListener('submit', login);
 document.getElementById('access-login-button')?.addEventListener('click', startAccessLogin);
 document.getElementById('local-login-toggle')?.addEventListener('click', () => document.getElementById('local-login-area')?.classList.toggle('hidden'));
-document.getElementById('logout-button').addEventListener('click', logout);
+document.getElementById('logout-button').addEventListener('click', openLogoutChoices);
 document.getElementById('modal-close').addEventListener('click', closeModal);
 document.getElementById('modal').addEventListener('click', event => { if (event.target.id === 'modal') closeModal(); });
 document.getElementById('menu-toggle').addEventListener('click', () => document.body.classList.toggle('nav-open'));
@@ -335,10 +335,18 @@ async function login(event) {
   finally { setLoading(false); }
 }
 
-async function logout() {
+function openLogoutChoices() {
+  openModal(`<div class="logout-sheet"><div class="mobile-sheet-handle"></div><span class="logout-eyebrow">Keamanan akun</span><h2>Pilih cara keluar</h2><p class="muted">Pilih apakah sesi AXINDO Access juga ingin diakhiri.</p><div class="logout-choice-list"><button type="button" class="logout-choice logout-choice-primary" data-logout-scope="axindo"><span class="logout-choice-icon">⇥</span><span><strong>Keluar dari AXINDO</strong><small>Keluar dari Kas Kecil dan akhiri sesi AXINDO Access.</small></span></button><button type="button" class="logout-choice" data-logout-scope="local"><span class="logout-choice-icon">↪</span><span><strong>Keluar dari aplikasi ini saja</strong><small>Sesi aplikasi AXINDO lain tetap aktif.</small></span></button></div></div>`);
+  document.querySelectorAll('[data-logout-scope]').forEach(button => button.addEventListener('click', () => logout(button.dataset.logoutScope)));
+}
+
+async function logout(scope = 'local') {
+  closeModal();
   setLoading(true);
-  try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+  let result = null;
+  try { result = await api('/api/auth/logout', { method: 'POST', body: { scope } }); } catch {}
   state.user = null; state.permissions = new Set(); showLogin(); setLoading(false);
+  if (result?.logoutUrl) window.location.assign(result.logoutUrl);
 }
 
 async function bootstrap() {
@@ -1462,7 +1470,7 @@ function mobileAccountPanel() {
 function bindMobileAccountPanel() {
   document.querySelectorAll('[data-mobile-feature]').forEach(button => button.addEventListener('click', () => openPage(button.dataset.mobileFeature)));
   document.querySelector('[data-mobile-theme]')?.addEventListener('click', () => { toggleTheme(); renderProfile(); });
-  document.querySelector('[data-mobile-logout]')?.addEventListener('click', logout);
+  document.querySelector('[data-mobile-logout]')?.addEventListener('click', openLogoutChoices);
 }
 
 function renderProfile() {

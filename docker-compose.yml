@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kas-kecil:1.7.1
+    image: kas-kecil:1.7.2
     container_name: kas-kecil
     restart: unless-stopped
     ports:
@@ -24,9 +24,16 @@ services:
       TRUST_PROXY: "${TRUST_PROXY:-false}"
       COOKIE_SECURE: "${COOKIE_SECURE:-false}"
       MOBILE_SESSION_DAYS: "${MOBILE_SESSION_DAYS:-30}"
+      PUBLIC_APP_URL: "${PUBLIC_APP_URL:-https://kaskecil.axindo.my.id}"
+      ACCESS_HANDOFF_ENABLED: "${ACCESS_HANDOFF_ENABLED:-false}"
+      ACCESS_PORTAL_URL: "${ACCESS_PORTAL_URL:-https://akses.axindo.my.id}"
+      ACCESS_PORTAL_INTERNAL_URL: "${ACCESS_PORTAL_INTERNAL_URL:-http://host.docker.internal:8096}"
+      LOCAL_SUPER_USER_LOGIN_ENABLED: "${LOCAL_SUPER_USER_LOGIN_ENABLED:-true}"
       DATA_DIR: /app/data
       UPLOAD_DIR: /app/uploads
       BACKUP_DIR: /app/backups
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - "${DATA_ROOT:-/var/lib/kas-kecil}/database:/app/data"
       - "${DATA_ROOT:-/var/lib/kas-kecil}/uploads:/app/uploads"

@@ -1,6 +1,6 @@
 Kas Kecil untuk Ubuntu dan Linux
-Versi: 1.7.1
-Tanggal: 2026-09-14
+Versi: 1.7.2
+Tanggal: 2026-09-18
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
@@ -38,6 +38,7 @@ Fitur utama:
 - Pagu kas bulanan per akun, periode terkunci, dan proses End of Month
 - API Bearer token khusus aplikasi Android dengan masa sesi terpisah
 - Login/logout Android tanpa mengubah sesi cookie aplikasi web
+- Dua pilihan logout web: hanya Kas Kecil atau sekaligus AXINDO Access
 
 - Tautan approval tidak memiliki masa kedaluwarsa dan tetap dilindungi PIN serta status pengajuan
 - Akun kas yang belum pernah digunakan dapat dihapus; akun bertransaksi hanya dapat dinonaktifkan

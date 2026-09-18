@@ -123,6 +123,15 @@ tr:last-child td { border-bottom: 0; }
 .modal { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 20px; background: rgba(15,39,71,.55); }
 .modal-card { position: relative; width: min(760px,100%); max-height: 90vh; overflow: auto; background: var(--surface); border-radius: 15px; padding: 24px; box-shadow: var(--shadow); }
 .modal-close { position: absolute; right: 12px; top: 10px; width: 34px; height: 34px; border: 0; border-radius: 50%; background: #eef2f7; font-size: 22px; }
+.logout-sheet h2 { margin: 4px 0; }
+.logout-eyebrow { color: var(--blue); font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.logout-choice-list { display: grid; gap: 10px; margin-top: 18px; }
+.logout-choice { width: 100%; display: grid; grid-template-columns: 46px 1fr; align-items: center; gap: 12px; padding: 15px; border: 1px solid var(--line); border-radius: 15px; color: var(--text); background: var(--surface); text-align: left; cursor: pointer; }
+.logout-choice:hover { border-color: var(--blue); box-shadow: 0 10px 24px rgba(15,39,71,.09); }
+.logout-choice-primary { border-color: color-mix(in srgb,var(--blue) 35%,var(--line)); background: color-mix(in srgb,var(--blue) 7%,var(--surface)); }
+.logout-choice-icon { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 14px; color: var(--blue); background: var(--sky); font-size: 22px; }
+.logout-choice strong,.logout-choice small { display: block; }
+.logout-choice small { margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.4; }
 .public-approval-wrap { min-height: 100vh; padding: 28px 16px; background: linear-gradient(135deg,var(--sky),var(--bg) 55%,var(--sky)); }
 .public-approval-shell { width: min(920px,100%); margin: 0 auto; }
 .public-brand { margin-bottom: 20px; padding: 0 4px; }

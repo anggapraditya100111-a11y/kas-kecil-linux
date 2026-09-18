@@ -49,6 +49,14 @@ function publicAuth() {
   };
 }
 
+function logoutUrl() {
+  const returnTo = new URL(publicAppUrl);
+  returnTo.searchParams.set('logout', 'axindo');
+  const target = new URL('/logout', portalUrl);
+  target.searchParams.set('return_to', returnTo.href);
+  return target.href;
+}
+
 function allowLocalUser(user) {
   if (!enabled) return true;
   return Boolean(localSuperUserEnabled && user && (user.auth_source || 'LOCAL') === 'LOCAL' && user.role === 'SUPER_USER');
@@ -118,6 +126,7 @@ module.exports = {
   enabled,
   manifest,
   publicAuth,
+  logoutUrl,
   allowLocalUser,
   roleForGroups,
   exchangeHandoff,

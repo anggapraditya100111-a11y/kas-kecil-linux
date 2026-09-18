@@ -78,6 +78,15 @@ test('autentikasi Android memakai Bearer token terpisah tanpa mengubah login web
   assert.match(server, /res\.cookie\(COOKIE_NAME/);
 });
 
+test('logout web menawarkan pilihan lokal atau AXINDO di desktop dan mobile', () => {
+  assert.match(client, /Keluar dari AXINDO/);
+  assert.match(client, /Keluar dari aplikasi ini saja/);
+  assert.match(client, /body: \{ scope \}/);
+  assert.match(client, /data-mobile-logout.*openLogoutChoices/s);
+  assert.match(server, /access\.logoutUrl\(\)/);
+  assert.match(styles, /\.logout-choice-list/);
+});
+
 test('nomor dokumen diselaraskan dengan nomor yang sudah tersimpan', () => {
   assert.match(server, /existingSequence/);
   assert.match(server, /Math\.max\(storedSequence, existingSequence\) \+ 1/);
@@ -190,8 +199,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.7\.1/);
-  assert.match(html, /app\.js\?v=1\.7\.1/);
+  assert.match(html, /styles\.css\?v=1\.7\.2/);
+  assert.match(html, /app\.js\?v=1\.7\.2/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
