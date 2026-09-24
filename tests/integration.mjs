@@ -53,8 +53,8 @@ async function mobileLogin(username, password) {
   return payload.accessToken;
 }
 
-async function request(route, { cookie, bearer, method = 'GET', body, form, expected = 200 } = {}) {
-  const headers = {};
+async function request(route, { cookie, bearer, method = 'GET', body, form, expected = 200, headers: requestHeaders = {} } = {}) {
+  const headers = { ...requestHeaders };
   if (cookie) headers.Cookie = cookie;
   if (bearer) headers.Authorization = `Bearer ${bearer}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -104,11 +104,11 @@ async function main() {
   await waitForHealth();
 
   const health = await request('/api/health');
-  assert.equal(health.version, '1.7.2');
+  assert.equal(health.version, '1.7.3');
   const shellResponse = await fetch(`${baseUrl}/`);
   assert.equal(shellResponse.headers.get('cache-control'), 'no-store');
   await shellResponse.text();
-  for (const asset of ['/app.js?v=1.7.2', '/styles.css?v=1.7.2']) {
+  for (const asset of ['/app.js?v=1.7.3', '/styles.css?v=1.7.3']) {
     const assetResponse = await fetch(`${baseUrl}${asset}`);
     assert.equal(assetResponse.status, 200);
     assert.equal(assetResponse.headers.get('cache-control'), 'no-cache, must-revalidate');
@@ -214,14 +214,34 @@ async function main() {
   assert.equal(staffBudget.totalBudget, 20000);
   assert.equal(staffBudget.allocations[0].allocatedAmount, 20000);
 
-  const cashIn = new FormData();
-  cashIn.set('type', 'MASUK'); cashIn.set('transactionDate', today);
-  cashIn.set('accountId', incoming.accountId); cashIn.set('amount', '10000'); cashIn.set('description', 'Pengisian kas awal');
-  const inResult = await request('/api/transactions', { cookie: staffA, method: 'POST', form: cashIn, expected: 201 });
+  const cashInKey = 'integration-transaction-0001';
+  const cashInForm = (amount = '10000') => {
+    const form = new FormData();
+    form.set('type', 'MASUK'); form.set('transactionDate', today);
+    form.set('accountId', incoming.accountId); form.set('amount', amount); form.set('description', 'Pengisian kas awal');
+    return form;
+  };
+  const inResult = await request('/api/transactions', {
+    cookie: staffA, method: 'POST', form: cashInForm(), expected: 201,
+    headers: { 'Idempotency-Key': cashInKey }
+  });
   assert.equal(inResult.status, 'APPROVED');
+  const inReplay = await request('/api/transactions', {
+    cookie: staffA, method: 'POST', form: cashInForm(), expected: 200,
+    headers: { 'Idempotency-Key': cashInKey }
+  });
+  assert.equal(inReplay.duplicate, true);
+  assert.equal(inReplay.transactionId, inResult.transactionId);
+  assert.equal(inReplay.transactionNo, inResult.transactionNo);
+  await request('/api/transactions', {
+    cookie: staffA, method: 'POST', form: cashInForm('12000'), expected: 409,
+    headers: { 'Idempotency-Key': cashInKey }
+  });
 
   const dbModule = await import('../src/db.js');
   const integrationDb = dbModule.default?.db || dbModule.db;
+  assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM transactions WHERE id=?').get(inResult.transactionId).total, 1);
+  assert.equal(integrationDb.prepare("SELECT COUNT(*) AS total FROM request_idempotency WHERE operation='CREATE_TRANSACTION' AND request_id=?").get(cashInKey).total, 1);
   integrationDb.prepare("DELETE FROM sequences WHERE prefix='KSK'").run();
 
   const cashOut = new FormData();
@@ -253,21 +273,39 @@ async function main() {
   assert.equal(mutationsA.balance, 9000);
   assert.equal(mutationsA.count, 2);
 
+  const transferKey = 'integration-transfer-0001';
+  const transferBody = { transferDate: today, recipientUserId: staffBResult.userId, amount: 2000, description: 'Penyerahan kas operasional' };
   const transfer = await request('/api/transfers', {
-    cookie: staffA, method: 'POST', expected: 201,
-    body: { transferDate: today, recipientUserId: staffBResult.userId, amount: 2000, description: 'Penyerahan kas operasional' }
+    cookie: staffA, method: 'POST', expected: 201, body: transferBody,
+    headers: { 'Idempotency-Key': transferKey }
   });
+  const transferReplay = await request('/api/transfers', {
+    cookie: staffA, method: 'POST', expected: 200, body: transferBody,
+    headers: { 'Idempotency-Key': transferKey }
+  });
+  assert.equal(transferReplay.duplicate, true);
+  assert.equal(transferReplay.transferId, transfer.transferId);
+  assert.equal(transferReplay.transferNo, transfer.transferNo);
   assert.equal((await approvePublic(transfer.approvalUrl)).entityType, 'TRANSFER');
   mutationsA = await request('/api/mutations', { cookie: staffA });
   const mutationsB = await request('/api/mutations', { cookie: staffB });
   assert.equal(mutationsA.balance, 7000);
   assert.equal(mutationsB.balance, 2000);
 
+  const umoKey = 'integration-umo-issue-0001';
+  const umoBody = { advanceDate: today, dueDate: businessDate(3),
+    bearerName: 'Teknisi A', advanceAmount: 400, purpose: 'Pembelian kebutuhan lapangan' };
   const umo = await request('/api/umo', {
-    cookie: staffA, method: 'POST', expected: 201,
-    body: { advanceDate: today, dueDate: businessDate(3),
-      bearerName: 'Teknisi A', advanceAmount: 400, purpose: 'Pembelian kebutuhan lapangan' }
+    cookie: staffA, method: 'POST', expected: 201, body: umoBody,
+    headers: { 'Idempotency-Key': umoKey }
   });
+  const umoReplay = await request('/api/umo', {
+    cookie: staffA, method: 'POST', expected: 200, body: umoBody,
+    headers: { 'Idempotency-Key': umoKey }
+  });
+  assert.equal(umoReplay.duplicate, true);
+  assert.equal(umoReplay.umoId, umo.umoId);
+  assert.equal(umoReplay.umoNo, umo.umoNo);
   assert.equal(umo.status, 'OPEN');
   assert.match(umo.receiptPdfUrl, /disbursement-receipt\.pdf$/);
   await assertDownload(umo.receiptPdfUrl, staffA, /application\/pdf/, 500);
@@ -294,11 +332,22 @@ async function main() {
   assert.equal(correctedUmoRow.advanceAmount, 450);
   assert.equal(correctedUmoRow.purpose, 'Pembelian kebutuhan lapangan terkoreksi');
 
-  const settlement = new FormData();
-  settlement.set('allocations', JSON.stringify([{ accountId: outgoing.accountId, amount: 350, description: 'Pembelian kebutuhan aktual' }]));
-  settlement.set('note', 'Sisa dikembalikan');
-  settlement.set('receipt', new Blob([Buffer.from('%PDF-1.4\n%%EOF')], { type: 'application/pdf' }), 'nota-umo.pdf');
-  const settled = await request(`/api/umo/${umo.umoId}/settlement`, { cookie: staffA, method: 'POST', form: settlement });
+  const settlementKey = 'integration-umo-settlement-0001';
+  const settlementForm = () => {
+    const form = new FormData();
+    form.set('allocations', JSON.stringify([{ accountId: outgoing.accountId, amount: 350, description: 'Pembelian kebutuhan aktual' }]));
+    form.set('note', 'Sisa dikembalikan');
+    form.set('receipt', new Blob([Buffer.from('%PDF-1.4\n%%EOF')], { type: 'application/pdf' }), 'nota-umo.pdf');
+    return form;
+  };
+  const settled = await request(`/api/umo/${umo.umoId}/settlement`, {
+    cookie: staffA, method: 'POST', form: settlementForm(), headers: { 'Idempotency-Key': settlementKey }
+  });
+  const settledReplay = await request(`/api/umo/${umo.umoId}/settlement`, {
+    cookie: staffA, method: 'POST', form: settlementForm(), headers: { 'Idempotency-Key': settlementKey }
+  });
+  assert.equal(settledReplay.duplicate, true);
+  assert.equal(settledReplay.umoId, umo.umoId);
   assert.equal(settled.status, 'SETTLED');
   assert.equal(settled.returnedAmount, 100);
   assert.equal((await request('/api/mutations', { cookie: staffA })).balance, 6650, 'UMO realization must not reduce cash twice');
@@ -328,12 +377,25 @@ async function main() {
   assert.equal(deletedUmo.balance, 6650);
   assert.equal((await request('/api/umo', { cookie: staffA })).rows.some(row => row.umoId === disposableUmo.umoId), false);
 
-  const correction = new FormData();
-  correction.set('originalTransactionId', outResult.transactionId); correction.set('correctionType', 'REPLACEMENT');
-  correction.set('reason', 'Nominal pada nota salah input'); correction.set('transactionDate', today);
-  correction.set('type', 'KELUAR'); correction.set('accountId', outgoing.accountId); correction.set('amount', '800');
-  correction.set('description', 'Pembelian perlengkapan terkoreksi'); correction.set('counterparty', 'Toko Contoh');
-  const correctionResult = await request('/api/corrections', { cookie: staffA, method: 'POST', form: correction, expected: 201 });
+  const correctionKey = 'integration-correction-0001';
+  const correctionForm = () => {
+    const form = new FormData();
+    form.set('originalTransactionId', outResult.transactionId); form.set('correctionType', 'REPLACEMENT');
+    form.set('reason', 'Nominal pada nota salah input'); form.set('transactionDate', today);
+    form.set('type', 'KELUAR'); form.set('accountId', outgoing.accountId); form.set('amount', '800');
+    form.set('description', 'Pembelian perlengkapan terkoreksi'); form.set('counterparty', 'Toko Contoh');
+    return form;
+  };
+  const correctionResult = await request('/api/corrections', {
+    cookie: staffA, method: 'POST', form: correctionForm(), expected: 201,
+    headers: { 'Idempotency-Key': correctionKey }
+  });
+  const correctionReplay = await request('/api/corrections', {
+    cookie: staffA, method: 'POST', form: correctionForm(), expected: 200,
+    headers: { 'Idempotency-Key': correctionKey }
+  });
+  assert.equal(correctionReplay.duplicate, true);
+  assert.equal(correctionReplay.correctionId, correctionResult.correctionId);
   const correctionDetail = await approvePublic(correctionResult.approvalUrl);
   assert.equal(correctionDetail.entityType, 'CORRECTION');
   assert.equal((await request('/api/mutations', { cookie: staffA })).balance, 6850);
@@ -403,7 +465,7 @@ async function main() {
   });
   assert.match(cleared.backup.fileName, /^kas-kecil-before-clear-.*\.sqlite$/);
   assert(cleared.recordCount > 0);
-  for (const table of ['transactions', 'ledger_entries', 'cash_transfers', 'operational_advances', 'umo_allocations', 'transaction_corrections', 'approval_requests']) {
+  for (const table of ['request_idempotency', 'transactions', 'ledger_entries', 'cash_transfers', 'operational_advances', 'umo_allocations', 'transaction_corrections', 'approval_requests']) {
     assert.equal(integrationDb.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get().total, 0, `${table} belum kosong`);
   }
   assert.equal(integrationDb.prepare('SELECT COUNT(*) AS total FROM users').get().total, 4, 'Pengguna harus dipertahankan');
@@ -418,7 +480,7 @@ async function main() {
   assert(auditRows.rows.some(row => row.action === 'CLEAR_DATABASE'));
 
   console.log(JSON.stringify({
-    checks: 'passed', version: '1.7.2', users: 4, publicPinApproval: true, persistentApprovalLink: true,
+    checks: 'passed', version: '1.7.3', users: 4, publicPinApproval: true, persistentApprovalLink: true,
     branding: true, responsiveTheme: true, mutationBalance: true, transferDoubleEntry: true,
     umoNoDoubleCharge: true, umoReceiptPdf: true, correctionReversal: true, accountList: true,
     accountSummary: true, accountSummaryExport: true, accountComparison: true, underlyingDocument: true,

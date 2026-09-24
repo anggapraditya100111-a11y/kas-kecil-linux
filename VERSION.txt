@@ -1,12 +1,13 @@
 Kas Kecil untuk Ubuntu dan Linux
-Versi: 1.7.2
-Tanggal: 2026-09-18
+Versi: 1.7.3
+Tanggal: 2026-09-24
 Arsitektur: amd64
 Port default: 8090
 Database: SQLite WAL
 Repository publik: https://github.com/anggapraditya100111-a11y/kas-kecil-linux
 
 Fitur utama:
+- Pencegahan input ganda end-to-end dengan pengunci formulir, batas waktu koneksi, dan idempotensi server
 - Hak akses granular per pengguna
 - SPV tanpa akses input transaksi secara default
 - Dashboard sendiri, seluruh pengguna, dan filter per pengguna

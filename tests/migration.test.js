@@ -53,6 +53,7 @@ test('database v1.0 dimigrasikan tanpa kehilangan transaksi', () => {
     assert(db.prepare('PRAGMA table_info(users)').all().some(item => item.name === column), `users.${column} belum dibuat`);
   }
   assert(db.prepare('PRAGMA table_info(sessions)').all().some(column => column.name === 'auth_source'));
+  assert(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_idempotency'").get(), 'request_idempotency belum dibuat');
   for (const table of ['accounting_periods', 'period_balances', 'cash_budgets', 'cash_budget_allocations']) {
     assert(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table), `${table} belum dibuat`);
   }

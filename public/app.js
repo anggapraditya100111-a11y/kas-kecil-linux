@@ -135,6 +135,65 @@ async function decidePublicApproval(decision) {
   finally { setLoading(false); }
 }
 
+const WRITE_REQUEST_TIMEOUT_MS = 45000;
+
+function createRequestId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `web-${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function beginFinancialSubmit(form, label = 'Sedang menyimpan…') {
+  if (!form || form.dataset.submitting === 'true') return null;
+  form.dataset.submitting = 'true';
+  form.dataset.requestId ||= createRequestId();
+  if (!form.dataset.requestIdResetBound) {
+    const resetRequestId = () => {
+      if (form.dataset.submitting !== 'true') delete form.dataset.requestId;
+    };
+    form.addEventListener('input', resetRequestId);
+    form.addEventListener('change', resetRequestId);
+    form.dataset.requestIdResetBound = 'true';
+  }
+  const button = form.querySelector('button[type="submit"]');
+  const originalHtml = button?.innerHTML || '';
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = label;
+  }
+  return { form, button, originalHtml, requestId: form.dataset.requestId };
+}
+
+function finishFinancialSubmit(submission, { success = false, error = null } = {}) {
+  if (!submission) return;
+  const definiteClientFailure = Number(error?.status || 0) >= 400 && Number(error?.status || 0) < 500;
+  if (success || definiteClientFailure) delete submission.form.dataset.requestId;
+  delete submission.form.dataset.submitting;
+  if (submission.button) {
+    submission.button.disabled = false;
+    submission.button.removeAttribute('aria-busy');
+    submission.button.innerHTML = submission.originalHtml;
+  }
+}
+
+function financialRequestOptions(submission) {
+  return {
+    headers: { 'Idempotency-Key': submission.requestId },
+    timeoutMs: WRITE_REQUEST_TIMEOUT_MS
+  };
+}
+
+function financialSubmitError(error) {
+  if (error?.indeterminate) {
+    return 'Koneksi terputus atau terlalu lama. Status penyimpanan belum dapat dipastikan. Periksa Aktivitas/Mutasi atau tekan Simpan lagi tanpa mengubah data; sistem tidak akan membuat transaksi ganda.';
+  }
+  return error?.message || 'Permintaan gagal.';
+}
+
+function refreshAfterFinancialSave() {
+  void bootstrap().catch(() => toast('Data sudah tersimpan, tetapi ringkasan belum berhasil diperbarui. Silakan muat ulang halaman.', true));
+}
+
 async function api(url, options = {}) {
   const request = { method: options.method || 'GET', headers: { ...(options.headers || {}) }, credentials: 'same-origin' };
   if (options.body instanceof FormData) request.body = options.body;
@@ -142,16 +201,36 @@ async function api(url, options = {}) {
     request.headers['Content-Type'] = 'application/json';
     request.body = JSON.stringify(options.body);
   }
-  const response = await fetch(url, request);
-  const type = response.headers.get('content-type') || '';
-  const payload = type.includes('application/json') ? await response.json() : await response.text();
-  if (!response.ok) {
-    const error = new Error(payload && payload.error ? payload.error : `Permintaan gagal (${response.status}).`);
-    error.status = response.status;
-    if (response.status === 401 && !approvalToken) showLogin();
-    throw error;
+
+  let timeoutId;
+  if (Number(options.timeoutMs) > 0 && !options.signal) {
+    const controller = new AbortController();
+    request.signal = controller.signal;
+    timeoutId = setTimeout(() => controller.abort(), Number(options.timeoutMs));
+  } else if (options.signal) {
+    request.signal = options.signal;
   }
-  return payload;
+
+  try {
+    const response = await fetch(url, request);
+    const type = response.headers.get('content-type') || '';
+    const payload = type.includes('application/json') ? await response.json() : await response.text();
+    if (!response.ok) {
+      const error = new Error(payload && payload.error ? payload.error : `Permintaan gagal (${response.status}).`);
+      error.status = response.status;
+      if (response.status === 401 && !approvalToken) showLogin();
+      throw error;
+    }
+    return payload;
+  } catch (error) {
+    if (error?.status) throw error;
+    const connectionError = new Error('Koneksi terputus atau waktu tunggu habis.');
+    connectionError.indeterminate = true;
+    connectionError.cause = error;
+    throw connectionError;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 async function apiBlob(url, options = {}) {
@@ -696,21 +775,37 @@ function updateTransactionAccountInfo() {
 }
 
 async function submitTransaction(event) {
-  event.preventDefault(); setLoading(true);
+  event.preventDefault();
+  const submission = beginFinancialSubmit(event.currentTarget);
+  if (!submission) return;
+  setLoading(true);
+  let saved = false;
+  let failure = null;
   try {
-    const form = new FormData(event.target);
+    const form = new FormData(event.currentTarget);
     form.set('amount', String(parseMoney(value('tx-amount'))));
     form.delete('receipt');
     form.delete('underlyingDocument');
     const receipt = selectedReceipt('tx-receipt'); if (receipt) form.set('receipt', receipt);
     const underlying = selectedReceipt('tx-underlying'); if (underlying) form.set('underlyingDocument', underlying);
-    const result = await api('/api/transactions', { method: 'POST', body: form });
-    document.getElementById('tx-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.transactionNo)}</strong> tersimpan dengan status <strong>${escapeHtml(result.status)}</strong>.${result.approvalUrl ? `<br><br><label>Tautan approval</label><div class="copy-row"><input id="approval-url" class="readonly-link" readonly aria-readonly="true" value="${escapeHtml(result.approvalUrl)}"><button id="copy-approval" type="button" class="btn btn-sm">Salin tautan</button></div>` : ''}</div>`;
+    const result = await api('/api/transactions', { method: 'POST', body: form, ...financialRequestOptions(submission) });
+    saved = true;
+    const replay = result.duplicate ? '<br><small>Permintaan sebelumnya ditemukan; tidak dibuat transaksi ganda.</small>' : '';
+    document.getElementById('tx-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.transactionNo)}</strong> tersimpan dengan status <strong>${escapeHtml(result.status)}</strong>.${replay}${result.approvalUrl ? `<br><br><label>Tautan approval</label><div class="copy-row"><input id="approval-url" class="readonly-link" readonly aria-readonly="true" value="${escapeHtml(result.approvalUrl)}"><button id="copy-approval" type="button" class="btn btn-sm">Salin tautan</button></div>` : ''}</div>`;
     if (result.approvalUrl) document.getElementById('copy-approval').addEventListener('click', () => copyText(result.approvalUrl));
-    event.target.reset(); resetReceiptPicker('tx-receipt'); resetReceiptPicker('tx-underlying'); document.getElementById('tx-date').value = todayInput(); updateAccountOptions();
-    await bootstrap();
-  } catch (error) { toast(error.message, true); }
-  finally { setLoading(false); }
+    event.currentTarget.reset();
+    resetReceiptPicker('tx-receipt');
+    resetReceiptPicker('tx-underlying');
+    document.getElementById('tx-date').value = todayInput();
+    updateAccountOptions();
+    refreshAfterFinancialSave();
+  } catch (error) {
+    failure = error;
+    toast(financialSubmitError(error), true);
+  } finally {
+    finishFinancialSubmit(submission, { success: saved, error: failure });
+    setLoading(false);
+  }
 }
 
 async function loadUserOptions() {
@@ -968,12 +1063,30 @@ function transferTable(rows) {
 }
 
 async function submitTransfer(event) {
-  event.preventDefault(); setLoading(true);
+  event.preventDefault();
+  const submission = beginFinancialSubmit(event.currentTarget);
+  if (!submission) return;
+  setLoading(true);
+  let saved = false;
+  let failure = null;
   try {
-    const result = await api('/api/transfers', { method: 'POST', body: { transferDate: value('transfer-date'), recipientUserId: value('transfer-recipient'), amount: parseMoney(value('transfer-amount')), description: value('transfer-description') } });
-    document.getElementById('transfer-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.transferNo)}</strong> menunggu approval.${approvalResultHtml(result)}</div>`;
+    const result = await api('/api/transfers', {
+      method: 'POST',
+      body: { transferDate: value('transfer-date'), recipientUserId: value('transfer-recipient'), amount: parseMoney(value('transfer-amount')), description: value('transfer-description') },
+      ...financialRequestOptions(submission)
+    });
+    saved = true;
+    const replay = result.duplicate ? '<br><small>Permintaan sebelumnya ditemukan; tidak dibuat transfer ganda.</small>' : '';
+    document.getElementById('transfer-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.transferNo)}</strong> menunggu approval.${replay}${approvalResultHtml(result)}</div>`;
     bindGeneratedLink();
-  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+    refreshAfterFinancialSave();
+  } catch (error) {
+    failure = error;
+    toast(financialSubmitError(error), true);
+  } finally {
+    finishFinancialSubmit(submission, { success: saved, error: failure });
+    setLoading(false);
+  }
 }
 
 async function renderUmo() {
@@ -1048,13 +1161,31 @@ function beginUmoTransactionCorrection(transactionId, umoNo) {
 }
 
 async function submitUmo(event) {
-  event.preventDefault(); setLoading(true);
+  event.preventDefault();
+  const submission = beginFinancialSubmit(event.currentTarget);
+  if (!submission) return;
+  setLoading(true);
+  let saved = false;
+  let failure = null;
   try {
-    const result = await api('/api/umo', { method: 'POST', body: { advanceDate: value('umo-date'), dueDate: value('umo-due'), bearerName: value('umo-bearer'), advanceAmount: parseMoney(value('umo-amount')), purpose: value('umo-purpose') } });
+    const result = await api('/api/umo', {
+      method: 'POST',
+      body: { advanceDate: value('umo-date'), dueDate: value('umo-due'), bearerName: value('umo-bearer'), advanceAmount: parseMoney(value('umo-amount')), purpose: value('umo-purpose') },
+      ...financialRequestOptions(submission)
+    });
+    saved = true;
     const pdfButton = result.receiptPdfUrl ? `<br><br><a class="btn btn-sm" href="${escapeHtml(result.receiptPdfUrl)}" target="_blank" rel="noopener">Cetak PDF tanda terima</a>` : '';
-    document.getElementById('umo-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.umoNo)}</strong> tersimpan dengan status ${escapeHtml(result.status)}.${approvalResultHtml(result)}${pdfButton}</div>`;
+    const replay = result.duplicate ? '<br><small>Permintaan sebelumnya ditemukan; tidak dibuat UMO ganda.</small>' : '';
+    document.getElementById('umo-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.umoNo)}</strong> tersimpan dengan status ${escapeHtml(result.status)}.${replay}${approvalResultHtml(result)}${pdfButton}</div>`;
     bindGeneratedLink();
-  } catch (error) { toast(error.message, true); } finally { setLoading(false); }
+    refreshAfterFinancialSave();
+  } catch (error) {
+    failure = error;
+    toast(financialSubmitError(error), true);
+  } finally {
+    finishFinancialSubmit(submission, { success: saved, error: failure });
+    setLoading(false);
+  }
 }
 
 function openUmoSettlement(umoId) {
@@ -1070,12 +1201,35 @@ function openUmoSettlement(umoId) {
 
 async function submitUmoSettlement(event, umoId) {
   event.preventDefault();
+  const submission = beginFinancialSubmit(event.currentTarget);
+  if (!submission) return;
   const allocations = [...document.querySelectorAll('.allocation-row')].map(row => ({ accountId: row.querySelector('.umo-allocation-account').value, amount: parseMoney(row.querySelector('.umo-allocation-amount').value), description: row.querySelector('.umo-allocation-description').value }));
-  const receipt = selectedReceipt('umo-settlement-receipt'); if (!receipt) return toast('Nota atau bukti realisasi wajib dipilih.', true);
-  const form = new FormData(); form.set('allocations', JSON.stringify(allocations)); form.set('note', value('umo-settlement-note')); form.set('receipt', receipt);
+  const receipt = selectedReceipt('umo-settlement-receipt');
+  if (!receipt) {
+    finishFinancialSubmit(submission, { error: { status: 400 } });
+    return toast('Nota atau bukti realisasi wajib dipilih.', true);
+  }
+  const form = new FormData();
+  form.set('allocations', JSON.stringify(allocations));
+  form.set('note', value('umo-settlement-note'));
+  form.set('receipt', receipt);
   setLoading(true);
-  try { const result = await api(`/api/umo/${encodeURIComponent(umoId)}/settlement`, { method: 'POST', body: form }); closeModal(); toast(`${result.umoNo} dipertanggungjawabkan dengan status ${result.status}.`); await renderUmo(); }
-  catch (error) { toast(error.message, true); } finally { setLoading(false); }
+  let saved = false;
+  let failure = null;
+  try {
+    const result = await api(`/api/umo/${encodeURIComponent(umoId)}/settlement`, { method: 'POST', body: form, ...financialRequestOptions(submission) });
+    saved = true;
+    closeModal();
+    toast(`${result.umoNo} dipertanggungjawabkan dengan status ${result.status}.`);
+    await renderUmo();
+    refreshAfterFinancialSave();
+  } catch (error) {
+    failure = error;
+    toast(financialSubmitError(error), true);
+  } finally {
+    finishFinancialSubmit(submission, { success: saved, error: failure });
+    setLoading(false);
+  }
 }
 
 async function renderCorrections() {
@@ -1105,11 +1259,41 @@ function correctionTable(rows) {
 }
 
 async function submitCorrection(event) {
-  event.preventDefault(); const form = new FormData(); const type = value('correction-type'); form.set('originalTransactionId', value('correction-original')); form.set('correctionType', type); form.set('reason', value('correction-reason'));
-  if (type === 'REPLACEMENT') { form.set('transactionDate', value('correction-date')); form.set('type', value('correction-tx-type')); form.set('accountId', value('correction-account')); form.set('amount', String(parseMoney(value('correction-amount')))); form.set('counterparty', value('correction-counterparty')); form.set('description', value('correction-description')); const receipt = selectedReceipt('correction-receipt'); if (receipt) form.set('receipt', receipt); }
+  event.preventDefault();
+  const submission = beginFinancialSubmit(event.currentTarget);
+  if (!submission) return;
+  const form = new FormData();
+  const type = value('correction-type');
+  form.set('originalTransactionId', value('correction-original'));
+  form.set('correctionType', type);
+  form.set('reason', value('correction-reason'));
+  if (type === 'REPLACEMENT') {
+    form.set('transactionDate', value('correction-date'));
+    form.set('type', value('correction-tx-type'));
+    form.set('accountId', value('correction-account'));
+    form.set('amount', String(parseMoney(value('correction-amount'))));
+    form.set('counterparty', value('correction-counterparty'));
+    form.set('description', value('correction-description'));
+    const receipt = selectedReceipt('correction-receipt');
+    if (receipt) form.set('receipt', receipt);
+  }
   setLoading(true);
-  try { const result = await api('/api/corrections', { method: 'POST', body: form }); document.getElementById('correction-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.correctionNo)}</strong> menunggu approval.${approvalResultHtml(result)}</div>`; bindGeneratedLink(); }
-  catch (error) { toast(error.message, true); } finally { setLoading(false); }
+  let saved = false;
+  let failure = null;
+  try {
+    const result = await api('/api/corrections', { method: 'POST', body: form, ...financialRequestOptions(submission) });
+    saved = true;
+    const replay = result.duplicate ? '<br><small>Permintaan sebelumnya ditemukan; tidak dibuat koreksi ganda.</small>' : '';
+    document.getElementById('correction-result').innerHTML = `<div class="notice success"><strong>${escapeHtml(result.correctionNo)}</strong> menunggu approval.${replay}${approvalResultHtml(result)}</div>`;
+    bindGeneratedLink();
+    refreshAfterFinancialSave();
+  } catch (error) {
+    failure = error;
+    toast(financialSubmitError(error), true);
+  } finally {
+    finishFinancialSubmit(submission, { success: saved, error: failure });
+    setLoading(false);
+  }
 }
 
 async function renderApproval() {

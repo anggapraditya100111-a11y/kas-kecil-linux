@@ -199,8 +199,8 @@ test('reset database dilindungi dan selalu membuat backup historical', () => {
 });
 
 test('aset frontend domain tidak tertahan cache versi lama', () => {
-  assert.match(html, /styles\.css\?v=1\.7\.2/);
-  assert.match(html, /app\.js\?v=1\.7\.2/);
+  assert.match(html, /styles\.css\?v=1\.7\.3/);
+  assert.match(html, /app\.js\?v=1\.7\.3/);
   assert.match(server, /cacheControl: false/);
   assert.match(server, /isShell \? 'no-store' : 'no-cache, must-revalidate'/);
   assert.doesNotMatch(server, /maxAge: process\.env\.NODE_ENV === 'production' \? '1h'/);
@@ -289,4 +289,18 @@ test('domain produksi Ubuntu memakai kaskecil.axindo.my.id dan Android tidak dis
   assert.match(compose, /https:\/\/kaskecil\.axindo\.my\.id/);
   assert.match(accessSource, /https:\/\/kaskecil\.axindo\.my\.id/);
   assert.doesNotMatch(compose + accessSource, /https:\/\/kas\.axindo\.my\.id/);
+});
+
+
+test('submit keuangan dikunci dan dilindungi idempotensi end-to-end', () => {
+  assert.match(client, /beginFinancialSubmit/);
+  assert.match(client, /WRITE_REQUEST_TIMEOUT_MS/);
+  assert.match(client, /Idempotency-Key/);
+  assert.match(client, /Status penyimpanan belum dapat dipastikan/);
+  assert.match(server, /request_idempotency/);
+  assert.match(server, /idempotentEntityResponse/);
+  assert.match(server, /cleanupRequestUploads/);
+  for (const operation of ['CREATE_TRANSACTION', 'CREATE_TRANSFER', 'CREATE_UMO', 'SETTLE_UMO', 'CREATE_CORRECTION']) {
+    assert.match(server, new RegExp(operation));
+  }
 });

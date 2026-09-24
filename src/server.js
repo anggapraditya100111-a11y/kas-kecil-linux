@@ -53,7 +53,7 @@ const {
 } = require('./security');
 
 const PORT = Number(process.env.PORT || 8090);
-const APP_VERSION = '1.7.2';
+const APP_VERSION = '1.7.3';
 const APPROVAL_NO_EXPIRY = '9999-12-31T23:59:59.999Z';
 const SERVICE_NAME = process.env.SERVICE_NAME || 'kas-kecil';
 const DEFAULT_APP_NAME = process.env.DEFAULT_APP_NAME || 'Aplikasi Kas Kecil';
@@ -134,6 +134,24 @@ function safeFileName(value) {
 function requestFile(req, field) {
   if (req.file && req.file.fieldname === field) return req.file;
   return Array.isArray(req.files?.[field]) ? req.files[field][0] : null;
+}
+
+function cleanupRequestUploads(req) {
+  const uploaded = [req.file, ...Object.values(req.files || {}).flat()].filter(Boolean);
+  for (const file of uploaded) {
+    if (file.path && fs.existsSync(file.path)) {
+      try { fs.unlinkSync(file.path); } catch (ignored) {}
+    }
+  }
+}
+
+function fileFingerprint(file) {
+  if (!file) return null;
+  return {
+    name: safeFileName(file.originalname),
+    mime: String(file.mimetype || '').toLowerCase(),
+    size: Number(file.size || 0)
+  };
 }
 
 const upload = multer({
@@ -473,6 +491,79 @@ function approvalUrl(req, rawToken) {
   return rawToken ? `${req.protocol}://${req.get('host')}/?approval=${encodeURIComponent(rawToken)}` : '';
 }
 
+function idempotencyContext(req, operation, payload) {
+  const requestId = String(req.get('Idempotency-Key') || req.body?.clientRequestId || '').trim();
+  if (!requestId) return null;
+  if (!/^[A-Za-z0-9._:-]{16,128}$/.test(requestId)) {
+    throw new AppError('ID permintaan tidak valid. Muat ulang halaman lalu coba lagi.', 400);
+  }
+  return {
+    operation,
+    requestId,
+    requestHash: crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex')
+  };
+}
+
+function findIdempotentRequest(userId, context) {
+  if (!context) return null;
+  const row = db.prepare('SELECT * FROM request_idempotency WHERE user_id=? AND operation=? AND request_id=?')
+    .get(userId, context.operation, context.requestId);
+  if (row && row.request_hash !== context.requestHash) {
+    throw new AppError('ID permintaan sudah digunakan untuk data berbeda. Muat ulang formulir lalu coba lagi.', 409);
+  }
+  return row || null;
+}
+
+function rememberIdempotentRequest(userId, context, entityType, entityId) {
+  if (!context) return;
+  db.prepare('INSERT INTO request_idempotency(user_id,operation,request_id,request_hash,entity_type,entity_id,created_at) VALUES(?,?,?,?,?,?,?)')
+    .run(userId, context.operation, context.requestId, context.requestHash, entityType, entityId, nowIso());
+}
+
+function pendingApprovalUrl(req, entityType, entityId) {
+  const approval = db.prepare("SELECT * FROM approval_requests WHERE entity_type=? AND entity_id=? AND decision='PENDING'")
+    .get(entityType, entityId);
+  if (!approval) return '';
+  return approvalUrl(req, recoverOrRotateApprovalToken(approval, req.auth?.user?.id || 'SYSTEM'));
+}
+
+function idempotentEntityResponse(req, entityType, entityId, duplicate = false) {
+  if (entityType === 'TRANSACTION') {
+    const row = db.prepare('SELECT id,transaction_no,status FROM transactions WHERE id=?').get(entityId);
+    if (!row) throw new AppError('Referensi transaksi duplikat tidak ditemukan.', 409);
+    return { ok: true, transactionId: row.id, transactionNo: row.transaction_no, status: row.status,
+      approvalUrl: pendingApprovalUrl(req, 'TRANSACTION', row.id), duplicate };
+  }
+  if (entityType === 'TRANSFER') {
+    const row = db.prepare('SELECT id,transfer_no,status FROM cash_transfers WHERE id=?').get(entityId);
+    if (!row) throw new AppError('Referensi transfer duplikat tidak ditemukan.', 409);
+    return { ok: true, transferId: row.id, transferNo: row.transfer_no, status: row.status,
+      approvalUrl: pendingApprovalUrl(req, 'TRANSFER', row.id), duplicate };
+  }
+  if (entityType === 'UMO') {
+    const row = db.prepare('SELECT id,umo_no,status FROM operational_advances WHERE id=?').get(entityId);
+    if (!row) throw new AppError('Referensi UMO duplikat tidak ditemukan.', 409);
+    return { ok: true, umoId: row.id, umoNo: row.umo_no, status: row.status,
+      approvalUrl: pendingApprovalUrl(req, 'UMO_ISSUE', row.id),
+      receiptPdfUrl: row.status === 'OPEN' ? '/api/umo/' + encodeURIComponent(row.id) + '/disbursement-receipt.pdf' : '',
+      duplicate };
+  }
+  if (entityType === 'UMO_SETTLEMENT') {
+    const row = db.prepare('SELECT id,umo_no,status,settled_amount,returned_amount,extra_amount FROM operational_advances WHERE id=?').get(entityId);
+    if (!row) throw new AppError('Referensi pertanggungjawaban UMO duplikat tidak ditemukan.', 409);
+    return { ok: true, umoId: row.id, umoNo: row.umo_no, status: row.status,
+      settledAmount: Number(row.settled_amount || 0), returnedAmount: Number(row.returned_amount || 0),
+      extraAmount: Number(row.extra_amount || 0), approvalUrl: pendingApprovalUrl(req, 'UMO_SETTLEMENT', row.id), duplicate };
+  }
+  if (entityType === 'CORRECTION') {
+    const row = db.prepare('SELECT id,correction_no,status FROM transaction_corrections WHERE id=?').get(entityId);
+    if (!row) throw new AppError('Referensi koreksi duplikat tidak ditemukan.', 409);
+    return { ok: true, correctionId: row.id, correctionNo: row.correction_no, status: row.status,
+      approvalUrl: pendingApprovalUrl(req, 'CORRECTION', row.id), duplicate };
+  }
+  throw new AppError('Jenis referensi duplikat tidak dikenal.', 409);
+}
+
 function publicAppConfig() {
   const logoFile = path.basename(String(getSetting('COMPANY_LOGO_FILE', '') || ''));
   const themeColor = String(getSetting('THEME_COLOR', '#1d4ed8'));
@@ -749,63 +840,67 @@ app.post('/api/transactions', authMiddleware, requirePermission('transactions.cr
   { name: 'underlyingDocument', maxCount: 1 }
 ]), (req, res, next) => {
   try {
-    const type = String(req.body.type || '').toUpperCase();
-    if (!['MASUK', 'KELUAR'].includes(type)) throw new AppError('Jenis transaksi tidak valid.');
+    const receiptFile = requestFile(req, 'receipt');
+    const underlyingFile = requestFile(req, 'underlyingDocument');
+    const typeInput = String(req.body.type || '').toUpperCase();
+    const idempotency = idempotencyContext(req, 'CREATE_TRANSACTION', {
+      type: typeInput,
+      transactionDate: String(req.body.transactionDate || ''),
+      accountId: String(req.body.accountId || ''),
+      amount: String(req.body.amount || ''),
+      description: String(req.body.description || ''),
+      counterparty: String(req.body.counterparty || ''),
+      receipt: fileFingerprint(receiptFile),
+      underlyingDocument: fileFingerprint(underlyingFile)
+    });
+    const replay = findIdempotentRequest(req.auth.user.id, idempotency);
+    if (replay) {
+      cleanupRequestUploads(req);
+      return res.status(200).json(idempotentEntityResponse(req, replay.entity_type, replay.entity_id, true));
+    }
+
+    if (!['MASUK', 'KELUAR'].includes(typeInput)) throw new AppError('Jenis transaksi tidak valid.');
     const transactionDate = assertOpenTransactionDate(req.body.transactionDate, 'Tanggal transaksi');
     const amount = toAmount(req.body.amount);
     if (amount <= 0) throw new AppError('Nominal transaksi harus lebih dari nol.');
     const account = db.prepare('SELECT * FROM accounts WHERE id=? AND active=1').get(String(req.body.accountId || ''));
     if (!account) throw new AppError('Akun transaksi tidak ditemukan.');
-    if (account.transaction_scope !== 'BOTH' && account.transaction_scope !== type) throw new AppError('Akun tidak sesuai dengan jenis transaksi.');
+    if (account.transaction_scope !== 'BOTH' && account.transaction_scope !== typeInput) throw new AppError('Akun tidak sesuai dengan jenis transaksi.');
     const description = cleanText(req.body.description, 500);
     if (!description) throw new AppError('Keterangan transaksi wajib diisi.');
-    const receiptFile = requestFile(req, 'receipt');
-    const underlyingFile = requestFile(req, 'underlyingDocument');
-    if (type === 'KELUAR' && account.receipt_required && !receiptFile) throw new AppError('Bukti transaksi wajib untuk akun ini.');
-    if (type === 'KELUAR' && account.underlying_required && !underlyingFile) throw new AppError('Underlying document wajib untuk akun ini.');
+    if (typeInput === 'KELUAR' && account.receipt_required && !receiptFile) throw new AppError('Bukti transaksi wajib untuk akun ini.');
+    if (typeInput === 'KELUAR' && account.underlying_required && !underlyingFile) throw new AppError('Underlying document wajib untuk akun ini.');
     const maxUploadBytes = Number(getSetting('MAX_UPLOAD_MB', 5)) * 1024 * 1024;
     if ([receiptFile, underlyingFile].some(file => file && file.size > maxUploadBytes)) {
-      throw new AppError(`Ukuran lampiran melebihi batas ${getSetting('MAX_UPLOAD_MB', 5)} MB per file.`);
+      throw new AppError('Ukuran lampiran melebihi batas ' + getSetting('MAX_UPLOAD_MB', 5) + ' MB per file.');
     }
 
-    const status = type === 'MASUK' || amount <= Number(account.approval_limit) ? 'APPROVED' : 'PENDING';
-    if (status === 'APPROVED' && type === 'KELUAR' && userBalance(req.auth.user.id) < amount) {
-      throw new AppError('Saldo kas tidak mencukupi untuk transaksi ini.');
-    }
-    let rawApprovalToken = '';
-    const transactionId = newId('TRX');
-    const now = nowIso();
-    const saveTransaction = db.transaction(() => {
-      const transactionNo = nextDocumentNo('KSK', req.auth.user.id);
-      db.prepare(`
-        INSERT INTO transactions(id,transaction_no,transaction_date,type,account_id,amount,approval_limit_snapshot,description,counterparty,
-          receipt_path,receipt_original_name,receipt_mime,underlying_path,underlying_original_name,underlying_mime,
-          status,created_by,created_at,approved_by,approved_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-      `).run(
-        transactionId, transactionNo, transactionDate, type, account.id, amount, Number(account.approval_limit), description,
-        cleanText(req.body.counterparty, 150), receiptFile ? receiptFile.filename : '', receiptFile ? safeFileName(receiptFile.originalname) : '',
-        receiptFile ? receiptFile.mimetype : '', underlyingFile ? underlyingFile.filename : '',
-        underlyingFile ? safeFileName(underlyingFile.originalname) : '', underlyingFile ? underlyingFile.mimetype : '',
-        status, req.auth.user.id, now, status === 'APPROVED' ? req.auth.user.id : null,
-        status === 'APPROVED' ? now : null
-      );
-      if (status === 'PENDING') {
-        rawApprovalToken = createApprovalRequest('TRANSACTION', transactionId);
-      } else {
-        postTransactionLedger(db.prepare('SELECT * FROM transactions WHERE id=?').get(transactionId), req.auth.user.id);
+    const status = typeInput === 'MASUK' || amount <= Number(account.approval_limit) ? 'APPROVED' : 'PENDING';
+    const result = db.transaction(() => {
+      const concurrentReplay = findIdempotentRequest(req.auth.user.id, idempotency);
+      if (concurrentReplay) return { duplicate: true, entityType: concurrentReplay.entity_type, entityId: concurrentReplay.entity_id };
+      if (status === 'APPROVED' && typeInput === 'KELUAR' && userBalance(req.auth.user.id) < amount) {
+        throw new AppError('Saldo kas tidak mencukupi untuk transaksi ini.');
       }
-      audit(req.auth.user.id, 'CREATE', 'TRANSACTION', transactionId, '', { transactionNo, amount, type, status }, 'Transaksi dibuat');
-      return transactionNo;
-    });
-    const transactionNo = saveTransaction();
-    res.status(201).json({
-      ok: true,
-      transactionId,
-      transactionNo,
-      status,
-      approvalUrl: approvalUrl(req, rawApprovalToken)
-    });
+      const transactionId = newId('TRX');
+      const transactionNo = nextDocumentNo('KSK', req.auth.user.id);
+      const now = nowIso();
+      db.prepare('INSERT INTO transactions(id,transaction_no,transaction_date,type,account_id,amount,approval_limit_snapshot,description,counterparty,receipt_path,receipt_original_name,receipt_mime,underlying_path,underlying_original_name,underlying_mime,status,created_by,created_at,approved_by,approved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(transactionId, transactionNo, transactionDate, typeInput, account.id, amount, Number(account.approval_limit), description,
+          cleanText(req.body.counterparty, 150), receiptFile ? receiptFile.filename : '', receiptFile ? safeFileName(receiptFile.originalname) : '',
+          receiptFile ? receiptFile.mimetype : '', underlyingFile ? underlyingFile.filename : '',
+          underlyingFile ? safeFileName(underlyingFile.originalname) : '', underlyingFile ? underlyingFile.mimetype : '',
+          status, req.auth.user.id, now, status === 'APPROVED' ? req.auth.user.id : null, status === 'APPROVED' ? now : null);
+      if (status === 'PENDING') createApprovalRequest('TRANSACTION', transactionId);
+      else postTransactionLedger(db.prepare('SELECT * FROM transactions WHERE id=?').get(transactionId), req.auth.user.id);
+      rememberIdempotentRequest(req.auth.user.id, idempotency, 'TRANSACTION', transactionId);
+      audit(req.auth.user.id, 'CREATE', 'TRANSACTION', transactionId, '', { transactionNo, amount, type: typeInput, status }, 'Transaksi dibuat');
+      return { duplicate: false, entityType: 'TRANSACTION', entityId: transactionId };
+    })();
+
+    if (result.duplicate) cleanupRequestUploads(req);
+    return res.status(result.duplicate ? 200 : 201)
+      .json(idempotentEntityResponse(req, result.entityType, result.entityId, result.duplicate));
   } catch (error) { next(error); }
 });
 
@@ -1467,25 +1562,39 @@ app.get('/api/transfers', authMiddleware, (req, res, next) => {
 
 app.post('/api/transfers', authMiddleware, requirePermission('transfers.create'), (req, res, next) => {
   try {
+    const idempotency = idempotencyContext(req, 'CREATE_TRANSFER', {
+      transferDate: String(req.body.transferDate || ''),
+      recipientUserId: String(req.body.recipientUserId || ''),
+      amount: String(req.body.amount || ''),
+      description: String(req.body.description || '')
+    });
+    const replay = findIdempotentRequest(req.auth.user.id, idempotency);
+    if (replay) return res.status(200).json(idempotentEntityResponse(req, replay.entity_type, replay.entity_id, true));
+
     const recipient = db.prepare("SELECT * FROM users WHERE id=? AND active=1 AND role='STAFF'").get(String(req.body.recipientUserId || ''));
     if (!recipient || recipient.id === req.auth.user.id) throw new AppError('Penerima transfer tidak valid.');
     const amount = toAmount(req.body.amount);
     if (amount <= 0) throw new AppError('Nominal transfer harus lebih dari nol.');
-    if (userBalance(req.auth.user.id) < amount) throw new AppError('Saldo kas tidak mencukupi.');
     const transferDate = assertOpenTransactionDate(req.body.transferDate || localToday(), 'Tanggal transfer');
     const description = cleanText(req.body.description, 500);
     if (!description) throw new AppError('Keterangan transfer wajib diisi.');
-    let rawToken = '';
-    let transferNo = '';
-    const id = newId('TRF');
-    db.transaction(() => {
-      transferNo = nextDocumentNo('TRF', req.auth.user.id);
-      db.prepare(`INSERT INTO cash_transfers(id,transfer_no,transfer_date,sender_user_id,recipient_user_id,amount,description,status,created_by,created_at)
-        VALUES(?,?,?,?,?,?,?,'PENDING',?,?)`).run(id, transferNo, transferDate, req.auth.user.id, recipient.id, amount, description, req.auth.user.id, nowIso());
-      rawToken = createApprovalRequest('TRANSFER', id);
+
+    const result = db.transaction(() => {
+      const concurrentReplay = findIdempotentRequest(req.auth.user.id, idempotency);
+      if (concurrentReplay) return { duplicate: true, entityType: concurrentReplay.entity_type, entityId: concurrentReplay.entity_id };
+      if (userBalance(req.auth.user.id) < amount) throw new AppError('Saldo kas tidak mencukupi.');
+      const id = newId('TRF');
+      const transferNo = nextDocumentNo('TRF', req.auth.user.id);
+      db.prepare("INSERT INTO cash_transfers(id,transfer_no,transfer_date,sender_user_id,recipient_user_id,amount,description,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'PENDING',?,?)")
+        .run(id, transferNo, transferDate, req.auth.user.id, recipient.id, amount, description, req.auth.user.id, nowIso());
+      createApprovalRequest('TRANSFER', id);
+      rememberIdempotentRequest(req.auth.user.id, idempotency, 'TRANSFER', id);
       audit(req.auth.user.id, 'CREATE', 'TRANSFER', id, '', { transferNo, recipient: recipient.name, amount }, 'Transfer kas diajukan');
+      return { duplicate: false, entityType: 'TRANSFER', entityId: id };
     })();
-    res.status(201).json({ ok: true, transferId: id, transferNo, status: 'PENDING', approvalUrl: approvalUrl(req, rawToken) });
+
+    return res.status(result.duplicate ? 200 : 201)
+      .json(idempotentEntityResponse(req, result.entityType, result.entityId, result.duplicate));
   } catch (error) { next(error); }
 });
 
@@ -1580,9 +1689,18 @@ app.get('/api/umo', authMiddleware, (req, res, next) => {
 
 app.post('/api/umo', authMiddleware, requirePermission('umo.create'), (req, res, next) => {
   try {
+    const idempotency = idempotencyContext(req, 'CREATE_UMO', {
+      advanceDate: String(req.body.advanceDate || ''),
+      dueDate: String(req.body.dueDate || ''),
+      bearerName: String(req.body.bearerName || ''),
+      advanceAmount: String(req.body.advanceAmount || ''),
+      purpose: String(req.body.purpose || '')
+    });
+    const replay = findIdempotentRequest(req.auth.user.id, idempotency);
+    if (replay) return res.status(200).json(idempotentEntityResponse(req, replay.entity_type, replay.entity_id, true));
+
     const amount = toAmount(req.body.advanceAmount);
     if (amount <= 0) throw new AppError('Nominal UMO harus lebih dari nol.');
-    if (userBalance(req.auth.user.id) < amount) throw new AppError('Saldo kas tidak mencukupi.');
     const bearerName = cleanText(req.body.bearerName, 120);
     const purpose = cleanText(req.body.purpose, 500);
     if (!bearerName || !purpose) throw new AppError('Pembawa uang dan keperluan wajib diisi.');
@@ -1591,28 +1709,45 @@ app.post('/api/umo', authMiddleware, requirePermission('umo.create'), (req, res,
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || dueDate < advanceDate) throw new AppError('Batas pertanggungjawaban tidak valid.');
     const needsApproval = amount > Number(getSetting('UMO_APPROVAL_LIMIT', 500000));
     const status = needsApproval ? 'PENDING' : 'OPEN';
-    const id = newId('UMO');
-    let umoNo = '';
-    let rawToken = '';
-    db.transaction(() => {
-      umoNo = nextDocumentNo('UMO', req.auth.user.id);
-      db.prepare(`INSERT INTO operational_advances(id,umo_no,advance_date,user_id,bearer_name,purpose,advance_amount,due_date,status,created_by,created_at,approved_by,approved_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?, ?,?)`).run(id, umoNo, advanceDate, req.auth.user.id, bearerName, purpose, amount, dueDate, status,
-        req.auth.user.id, nowIso(), needsApproval ? null : req.auth.user.id, needsApproval ? null : nowIso());
-      if (needsApproval) rawToken = createApprovalRequest('UMO_ISSUE', id);
+
+    const result = db.transaction(() => {
+      const concurrentReplay = findIdempotentRequest(req.auth.user.id, idempotency);
+      if (concurrentReplay) return { duplicate: true, entityType: concurrentReplay.entity_type, entityId: concurrentReplay.entity_id };
+      if (userBalance(req.auth.user.id) < amount) throw new AppError('Saldo kas tidak mencukupi.');
+      const id = newId('UMO');
+      const umoNo = nextDocumentNo('UMO', req.auth.user.id);
+      db.prepare('INSERT INTO operational_advances(id,umo_no,advance_date,user_id,bearer_name,purpose,advance_amount,due_date,status,created_by,created_at,approved_by,approved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        .run(id, umoNo, advanceDate, req.auth.user.id, bearerName, purpose, amount, dueDate, status,
+          req.auth.user.id, nowIso(), needsApproval ? null : req.auth.user.id, needsApproval ? null : nowIso());
+      if (needsApproval) createApprovalRequest('UMO_ISSUE', id);
       else postLedger({ userId: req.auth.user.id, entryDate: advanceDate, direction: 'OUT', amount, sourceType: 'UMO_ISSUE',
         sourceId: id, referenceNo: umoNo, description: purpose, createdBy: req.auth.user.id });
+      rememberIdempotentRequest(req.auth.user.id, idempotency, 'UMO', id);
       audit(req.auth.user.id, 'CREATE', 'UMO', id, '', { umoNo, amount, status }, 'UMO dibuat');
+      return { duplicate: false, entityType: 'UMO', entityId: id };
     })();
-    res.status(201).json({ ok: true, umoId: id, umoNo, status, approvalUrl: approvalUrl(req, rawToken),
-      receiptPdfUrl: status === 'OPEN' ? `/api/umo/${encodeURIComponent(id)}/disbursement-receipt.pdf` : '' });
+
+    return res.status(result.duplicate ? 200 : 201)
+      .json(idempotentEntityResponse(req, result.entityType, result.entityId, result.duplicate));
   } catch (error) { next(error); }
 });
 
 app.post('/api/umo/:umoId/settlement', authMiddleware, upload.single('receipt'), (req, res, next) => {
   try {
-    assertOpenTransactionDate(localToday(), 'Tanggal pertanggungjawaban UMO');
     if (!hasPermission(req, 'umo.create') && !hasPermission(req, 'umo.view_all')) throw new AppError('Anda tidak memiliki akses pertanggungjawaban UMO.', 403);
+    const idempotency = idempotencyContext(req, 'SETTLE_UMO', {
+      umoId: String(req.params.umoId || ''),
+      allocations: String(req.body.allocations || ''),
+      note: String(req.body.note || ''),
+      receipt: fileFingerprint(req.file)
+    });
+    const replay = findIdempotentRequest(req.auth.user.id, idempotency);
+    if (replay) {
+      cleanupRequestUploads(req);
+      return res.status(200).json(idempotentEntityResponse(req, replay.entity_type, replay.entity_id, true));
+    }
+
+    assertOpenTransactionDate(localToday(), 'Tanggal pertanggungjawaban UMO');
     const umo = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(req.params.umoId);
     if (!umo || umo.status !== 'OPEN') throw new AppError('UMO tidak tersedia untuk dipertanggungjawabkan.', 404);
     if (umo.user_id !== req.auth.user.id && !hasPermission(req, 'umo.view_all')) throw new AppError('Anda tidak memiliki akses ke UMO ini.', 403);
@@ -1630,22 +1765,29 @@ app.post('/api/umo/:umoId/settlement', authMiddleware, upload.single('receipt'),
     const settledAmount = normalized.reduce((sum, item) => sum + item.amount, 0);
     const returnedAmount = Math.max(0, Number(umo.advance_amount) - settledAmount);
     const extraAmount = Math.max(0, settledAmount - Number(umo.advance_amount));
-    if (extraAmount > 0 && userBalance(umo.user_id) < extraAmount) throw new AppError('Saldo kas tidak mencukupi untuk selisih realisasi UMO.');
     const needsApproval = extraAmount > 0 || normalized.some(item => item.amount > Number(item.account.approval_limit));
-    let rawToken = '';
-    db.transaction(() => {
+
+    const result = db.transaction(() => {
+      const concurrentReplay = findIdempotentRequest(req.auth.user.id, idempotency);
+      if (concurrentReplay) return { duplicate: true, entityType: concurrentReplay.entity_type, entityId: concurrentReplay.entity_id };
+      const currentUmo = db.prepare('SELECT * FROM operational_advances WHERE id=?').get(umo.id);
+      if (!currentUmo || currentUmo.status !== 'OPEN') throw new AppError('UMO tidak tersedia untuk dipertanggungjawabkan.', 409);
+      if (extraAmount > 0 && userBalance(umo.user_id) < extraAmount) throw new AppError('Saldo kas tidak mencukupi untuk selisih realisasi UMO.');
       db.prepare('DELETE FROM umo_allocations WHERE umo_id=? AND transaction_id IS NULL').run(umo.id);
       const insert = db.prepare('INSERT INTO umo_allocations(id,umo_id,account_id,amount,description,created_at) VALUES(?,?,?,?,?,?)');
       normalized.forEach(item => insert.run(newId('UAL'), umo.id, item.account.id, item.amount, item.description, nowIso()));
-      db.prepare(`UPDATE operational_advances SET status=?,settlement_note=?,settlement_receipt_path=?,settlement_receipt_name=?,settlement_receipt_mime=?,
-        settled_amount=?,returned_amount=?,extra_amount=?,rejection_reason=NULL WHERE id=?`).run(
-        needsApproval ? 'SETTLEMENT_PENDING' : 'OPEN', cleanText(req.body.note, 500), req.file.filename, safeFileName(req.file.originalname),
-        req.file.mimetype, settledAmount, returnedAmount, extraAmount, umo.id
-      );
-      if (needsApproval) rawToken = createApprovalRequest('UMO_SETTLEMENT', umo.id);
+      db.prepare('UPDATE operational_advances SET status=?,settlement_note=?,settlement_receipt_path=?,settlement_receipt_name=?,settlement_receipt_mime=?,settled_amount=?,returned_amount=?,extra_amount=?,rejection_reason=NULL WHERE id=?')
+        .run(needsApproval ? 'SETTLEMENT_PENDING' : 'OPEN', cleanText(req.body.note, 500), req.file.filename, safeFileName(req.file.originalname),
+          req.file.mimetype, settledAmount, returnedAmount, extraAmount, umo.id);
+      if (needsApproval) createApprovalRequest('UMO_SETTLEMENT', umo.id);
       else finalizeUmoSettlement(db.prepare('SELECT * FROM operational_advances WHERE id=?').get(umo.id), req.auth.user.id);
+      rememberIdempotentRequest(req.auth.user.id, idempotency, 'UMO_SETTLEMENT', umo.id);
+      return { duplicate: false, entityType: 'UMO_SETTLEMENT', entityId: umo.id };
     })();
-    res.json({ ok: true, umoNo: umo.umo_no, status: needsApproval ? 'SETTLEMENT_PENDING' : 'SETTLED', settledAmount, returnedAmount, extraAmount, approvalUrl: approvalUrl(req, rawToken) });
+
+    if (result.duplicate) cleanupRequestUploads(req);
+    return res.status(200)
+      .json(idempotentEntityResponse(req, result.entityType, result.entityId, result.duplicate));
   } catch (error) { next(error); }
 });
 
@@ -1877,41 +2019,68 @@ app.get('/api/corrections', authMiddleware, (req, res, next) => {
 
 app.post('/api/corrections', authMiddleware, requirePermission('corrections.create'), upload.single('receipt'), (req, res, next) => {
   try {
+    const correctionTypeInput = String(req.body.correctionType || '').toUpperCase();
+    const idempotency = idempotencyContext(req, 'CREATE_CORRECTION', {
+      originalTransactionId: String(req.body.originalTransactionId || ''),
+      correctionType: correctionTypeInput,
+      reason: String(req.body.reason || ''),
+      transactionDate: String(req.body.transactionDate || ''),
+      type: String(req.body.type || ''),
+      accountId: String(req.body.accountId || ''),
+      amount: String(req.body.amount || ''),
+      description: String(req.body.description || ''),
+      counterparty: String(req.body.counterparty || ''),
+      receipt: fileFingerprint(req.file)
+    });
+    const replay = findIdempotentRequest(req.auth.user.id, idempotency);
+    if (replay) {
+      cleanupRequestUploads(req);
+      return res.status(200).json(idempotentEntityResponse(req, replay.entity_type, replay.entity_id, true));
+    }
+
     assertOpenTransactionDate(localToday(), 'Tanggal koreksi');
     const original = db.prepare('SELECT * FROM transactions WHERE id=?').get(String(req.body.originalTransactionId || ''));
     if (!original || original.status !== 'APPROVED') throw new AppError('Transaksi asal tidak dapat dikoreksi.');
     if (original.created_by !== req.auth.user.id && !hasPermission(req, 'corrections.view_all')) throw new AppError('Anda tidak memiliki akses ke transaksi tersebut.', 403);
-    const existing = db.prepare("SELECT 1 FROM transaction_corrections WHERE original_transaction_id=? AND status IN ('PENDING','APPROVED')").get(original.id);
-    if (existing) throw new AppError('Transaksi tersebut sudah memiliki pengajuan koreksi.');
-    const correctionType = String(req.body.correctionType || '').toUpperCase();
-    if (!['REVERSAL','REPLACEMENT'].includes(correctionType)) throw new AppError('Jenis koreksi tidak valid.');
+    if (!['REVERSAL','REPLACEMENT'].includes(correctionTypeInput)) throw new AppError('Jenis koreksi tidak valid.');
     const reason = cleanText(req.body.reason, 500);
     if (!reason) throw new AppError('Alasan koreksi wajib diisi.');
     let proposed = { date: null, type: null, accountId: null, amount: null, description: null, counterparty: null };
-    if (correctionType === 'REPLACEMENT') {
-      proposed = { date: assertOpenTransactionDate(req.body.transactionDate || localToday(), 'Tanggal transaksi pengganti'), type: String(req.body.type || original.type).toUpperCase(),
-        accountId: String(req.body.accountId || original.account_id), amount: toAmount(req.body.amount || original.amount),
-        description: cleanText(req.body.description || original.description, 500), counterparty: cleanText(req.body.counterparty || original.counterparty, 150) };
+    if (correctionTypeInput === 'REPLACEMENT') {
+      proposed = {
+        date: assertOpenTransactionDate(req.body.transactionDate || localToday(), 'Tanggal transaksi pengganti'),
+        type: String(req.body.type || original.type).toUpperCase(),
+        accountId: String(req.body.accountId || original.account_id),
+        amount: toAmount(req.body.amount || original.amount),
+        description: cleanText(req.body.description || original.description, 500),
+        counterparty: cleanText(req.body.counterparty || original.counterparty, 150)
+      };
       const account = db.prepare('SELECT * FROM accounts WHERE id=? AND active=1').get(proposed.accountId);
-      if (!['MASUK','KELUAR'].includes(proposed.type) ||
-          !account || proposed.amount <= 0 || !proposed.description) throw new AppError('Data transaksi pengganti tidak valid.');
+      if (!['MASUK','KELUAR'].includes(proposed.type) || !account || proposed.amount <= 0 || !proposed.description) {
+        throw new AppError('Data transaksi pengganti tidak valid.');
+      }
     }
-    const id = newId('COR');
-    let correctionNo = '';
-    let rawToken = '';
-    db.transaction(() => {
-      correctionNo = nextDocumentNo('KOR', req.auth.user.id);
-      db.prepare(`INSERT INTO transaction_corrections(id,correction_no,original_transaction_id,correction_type,reason,proposed_date,proposed_type,
-        proposed_account_id,proposed_amount,proposed_description,proposed_counterparty,proposed_receipt_path,proposed_receipt_name,proposed_receipt_mime,
-        status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?)`).run(
-        id, correctionNo, original.id, correctionType, reason, proposed.date, proposed.type, proposed.accountId, proposed.amount,
-        proposed.description, proposed.counterparty, req.file ? req.file.filename : null, req.file ? safeFileName(req.file.originalname) : null,
-        req.file ? req.file.mimetype : null, req.auth.user.id, nowIso()
-      );
-      rawToken = createApprovalRequest('CORRECTION', id);
-      audit(req.auth.user.id, 'CREATE', 'CORRECTION', id, '', { correctionNo, original: original.transaction_no, correctionType }, 'Koreksi diajukan');
+
+    const result = db.transaction(() => {
+      const concurrentReplay = findIdempotentRequest(req.auth.user.id, idempotency);
+      if (concurrentReplay) return { duplicate: true, entityType: concurrentReplay.entity_type, entityId: concurrentReplay.entity_id };
+      const existing = db.prepare("SELECT 1 FROM transaction_corrections WHERE original_transaction_id=? AND status IN ('PENDING','APPROVED')").get(original.id);
+      if (existing) throw new AppError('Transaksi tersebut sudah memiliki pengajuan koreksi.');
+      const id = newId('COR');
+      const correctionNo = nextDocumentNo('KOR', req.auth.user.id);
+      db.prepare("INSERT INTO transaction_corrections(id,correction_no,original_transaction_id,correction_type,reason,proposed_date,proposed_type,proposed_account_id,proposed_amount,proposed_description,proposed_counterparty,proposed_receipt_path,proposed_receipt_name,proposed_receipt_mime,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?,?)")
+        .run(id, correctionNo, original.id, correctionTypeInput, reason, proposed.date, proposed.type, proposed.accountId, proposed.amount,
+          proposed.description, proposed.counterparty, req.file ? req.file.filename : null, req.file ? safeFileName(req.file.originalname) : null,
+          req.file ? req.file.mimetype : null, req.auth.user.id, nowIso());
+      createApprovalRequest('CORRECTION', id);
+      rememberIdempotentRequest(req.auth.user.id, idempotency, 'CORRECTION', id);
+      audit(req.auth.user.id, 'CREATE', 'CORRECTION', id, '', { correctionNo, original: original.transaction_no, correctionType: correctionTypeInput }, 'Koreksi diajukan');
+      return { duplicate: false, entityType: 'CORRECTION', entityId: id };
     })();
-    res.status(201).json({ ok: true, correctionId: id, correctionNo, status: 'PENDING', approvalUrl: approvalUrl(req, rawToken) });
+
+    if (result.duplicate) cleanupRequestUploads(req);
+    return res.status(result.duplicate ? 200 : 201)
+      .json(idempotentEntityResponse(req, result.entityType, result.entityId, result.duplicate));
   } catch (error) { next(error); }
 });
 
@@ -2518,7 +2687,7 @@ app.post('/api/admin/database/clear', authMiddleware, requireSuperUser, asyncRou
   }
 
   const tableOrder = [
-    'approval_requests', 'approvals', 'transaction_corrections', 'umo_allocations',
+    'request_idempotency', 'approval_requests', 'approvals', 'transaction_corrections', 'umo_allocations',
     'ledger_entries', 'cash_transfers', 'operational_advances', 'transactions', 'sequences',
     'cash_budget_allocations', 'cash_budgets', 'period_balances', 'accounting_periods', 'audit_logs'
   ];
@@ -2722,12 +2891,7 @@ app.use('/api', (_req, _res, next) => next(new AppError('Endpoint tidak ditemuka
 app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(path.join(publicDir, 'index.html')));
 
 app.use((error, req, res, _next) => {
-  const uploaded = [req.file, ...Object.values(req.files || {}).flat()].filter(Boolean);
-  for (const file of uploaded) {
-    if (file.path && fs.existsSync(file.path)) {
-      try { fs.unlinkSync(file.path); } catch (ignored) {}
-    }
-  }
+  cleanupRequestUploads(req);
   const status = Number(error.status || (error.code === 'LIMIT_FILE_SIZE' ? 400 : 500));
   const message = error.code === 'LIMIT_FILE_SIZE'
     ? (error.field === 'logo' ? 'Ukuran logo melebihi batas 2 MB.' : `Ukuran bukti melebihi batas ${getSetting('MAX_UPLOAD_MB', 5)} MB.`)

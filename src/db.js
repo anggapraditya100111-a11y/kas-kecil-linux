@@ -109,6 +109,20 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_transactions_creator ON transactions(created_by);
     CREATE INDEX IF NOT EXISTS idx_transactions_status ON transactions(status);
 
+    CREATE TABLE IF NOT EXISTS request_idempotency (
+      user_id TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(user_id, operation, request_id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_request_idempotency_created_at ON request_idempotency(created_at);
+
     CREATE TABLE IF NOT EXISTS approvals (
       id TEXT PRIMARY KEY,
       transaction_id TEXT NOT NULL UNIQUE,

@@ -2,6 +2,13 @@
 
 Aplikasi kas kecil berbasis web yang dapat dijalankan mandiri pada server Linux menggunakan Docker. Database SQLite, bukti transaksi, dan backup tersimpan di server Anda sendiri.
 
+## Perbaikan versi 1.7.3
+
+- Form keuangan dikunci saat penyimpanan dan menampilkan status proses yang jelas.
+- Server mencegah transaksi, transfer, UMO, pertanggungjawaban, atau koreksi tercatat dua kali ketika koneksi lambat dan permintaan dikirim ulang.
+- Batas waktu koneksi dan pembaruan ringkasan terpisah mencegah indikator loading terus berputar.
+- Migrasi database berjalan otomatis serta tetap kompatibel dengan data versi sebelumnya.
+
 ## Perbaikan versi 1.7.2
 
 - Tombol keluar menawarkan pilihan hanya dari Kas Kecil atau sekaligus dari AXINDO Access.
